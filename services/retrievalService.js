@@ -32,7 +32,7 @@ const INTENT_PAGE_TYPE_FILTER = {
 async function executeRetrievalPipeline(botId, query, chatHistory = [], intent = 'general', options = {}) {
   console.log(`\n🔎 [Retrieval Pipeline] Processing query for bot=${botId} | intent=${intent}`);
   const collectionName = getCollectionName(botId);
-  const opts = { botId, sessionId: options.sessionId || '' };
+  const opts = { botId, sessionId: options.sessionId || '', intent };
 
   // Stage D: Query Context Expansion & HyDE
   const { hydeText, expandedQuery } = await generateHyDEAndExpandQuery(query, chatHistory, opts);

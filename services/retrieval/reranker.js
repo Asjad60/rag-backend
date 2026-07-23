@@ -3,7 +3,7 @@ const { callOpenRouterChat } = require("../llmService");
 const { logLlmUsage } = require("../llmUsageService");
 
 const RERANK_SCORE_THRESHOLD = 0.75;
-const MAX_RERANKED_TOP_K = 5;
+const MAX_RERANKED_TOP_K = 3;
 
 /* ============================================================================
  * COHERE RERANKER (COMMENTED OUT FOR REFERENCE AS REQUESTED)

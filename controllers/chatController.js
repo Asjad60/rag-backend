@@ -1,93 +1,18 @@
 const Bot = require("../models/Bot");
 const mongoose = require("mongoose");
-const { generateEmbeddings } = require("../services/embeddingService");
 const {
   generateChatResponse,
   generateClarifyResponse,
   detectIntent,
   getRoutingBranch,
-  augmentQuery,
   checkGuardrails,
 } = require("../services/llmService");
 const { detectAndPrepare } = require("../services/languageService");
 const {
-  structuredProductSearch,
-} = require("../services/structuredSearchService");
-const {
   logChatEvent,
   updateFeedback,
 } = require("../services/analyticsService");
-const { getCollectionName } = require("../services/scraperService");
 const { executeRetrievalPipeline } = require("../services/retrievalService");
-const { qdrantClient } = require("../config/db");
-
-// ─── Intent → Page-Type filter map (Semantic RAG path) ───────────────────────
-// Each bot's data lives in its own collection — no botId filter needed.
-// This map only restricts which page types are searched within the collection.
-const INTENT_PAGE_TYPE_FILTER = {
-  contact: ["contact_page"],
-  about: ["about_page", "homepage"],
-  faq: ["faq_page"],
-  navigation: [],
-  general: [],
-};
-
-// ─── Helper: Semantic Search (Stage 3A) ──────────────────────────────────────
-
-/**
- * Intent-aware vector similarity search on the bot's dedicated collection.
- * No botId payload filter — the collection itself isolates bot data.
- *
- * @param {string}   collectionName - Bot's Qdrant collection (bot_<botId>)
- * @param {number[]} queryVector    - 1536-dim query embedding
- * @param {string}   intent         - Detailed intent from detectIntent()
- * @returns {Promise<Array>}
- */
-async function semanticSearch(collectionName, queryVector, intent) {
-  const allowedPageTypes = INTENT_PAGE_TYPE_FILTER[intent] ?? [];
-
-  // Build optional pageType filter (no botId filter needed)
-  const filter =
-    allowedPageTypes.length > 0
-      ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
-      : undefined;
-
-  let results = [];
-  try {
-    results = await qdrantClient.search(collectionName, {
-      vector: queryVector,
-      limit: 10,
-      filter,
-      with_payload: true,
-      score_threshold: 0.25,
-    });
-
-    // Fallback: if page-type filter returned nothing, search the full collection
-    if (results.length === 0 && allowedPageTypes.length > 0) {
-      console.log(
-        `⚠️  [Semantic] No results for filter [${allowedPageTypes}] — retrying without filter`,
-      );
-      results = await qdrantClient.search(collectionName, {
-        vector: queryVector,
-        limit: 10,
-        with_payload: true,
-      });
-    }
-
-    console.log(`🔍 [Semantic] ${results.length} chunks — intent="${intent}"`);
-  } catch (e) {
-    const msg = e.message || "";
-    if (msg.toLowerCase().includes("not found") || msg.includes("404")) {
-      console.warn(
-        `⚠️  Collection "${collectionName}" not found — bot may not be ingested yet`,
-      );
-    } else {
-      console.error("❌ [Semantic] Qdrant error:", e.message);
-    }
-  }
-
-  return results;
-}
 
 // ─── Helper: Build Context String (Stage 4) ───────────────────────────────────
 
@@ -100,7 +25,8 @@ async function semanticSearch(collectionName, queryVector, intent) {
  */
 function buildContextText(searchResults) {
   if (!searchResults || searchResults.length === 0) return "";
-  return searchResults
+  const topResults = searchResults.slice(0, 3);
+  let context = topResults
     .map((r, i) => {
       const {
         pageTitle,
@@ -128,6 +54,11 @@ function buildContextText(searchResults) {
       return lines.join("\n");
     })
     .join("\n\n---\n\n");
+
+  if (context.length > 6000) {
+    context = context.slice(0, 6000) + "\n...[truncated]";
+  }
+  return context;
 }
 
 exports.chat = async (req, res) => {
@@ -146,9 +77,6 @@ exports.chat = async (req, res) => {
 
     const bot = await Bot.findById(botId);
     if (!bot) return res.status(404).json({ message: "Bot not found" });
-
-    // Per-bot Qdrant collection (isolated, no cross-contamination)
-    const collectionName = getCollectionName(botId);
 
     const botMeta = {
       businessName: bot.businessName,
@@ -173,9 +101,25 @@ exports.chat = async (req, res) => {
 
     // ── Branch: Greeting ──────────────────────────────────────────────────────
     if (branch === "greeting") {
-      let reply =
-        bot.welcomeMessage ||
-        `Hi! I'm the AI assistant for ${bot.businessName || "this website"}. How can I help you today?`;
+      let reply = "";
+      const textToMatch = (queryForRetrieval || message)
+        .toLowerCase()
+        .replace(/[,!?.']/g, " ")
+        .trim();
+
+      if (/thanks|thank you|thx|appreciate|thank/i.test(textToMatch)) {
+        reply = `You're very welcome! Let me know if there's anything else I can help you with regarding ${bot.businessName || "our website"}.`;
+      } else if (/bye|goodbye|see ya|cya|farewell/i.test(textToMatch)) {
+        reply = `Goodbye! Have a great day!`;
+      } else if (/whats up|what's up|sup|what up/i.test(textToMatch)) {
+        reply = `Not much! I'm here to help you with any questions about ${bot.businessName || "this website"}. What can I help you find today?`;
+      } else if (/how are you|how's it going|how do you do/i.test(textToMatch)) {
+        reply = `I'm doing great, thank you! How can I assist you with ${bot.businessName || "this website"} today?`;
+      } else {
+        reply =
+          bot.welcomeMessage ||
+          `Hi! I'm the AI assistant for ${bot.businessName || "this website"}. How can I help you today?`;
+      }
       if (isNonEnglish) {
         reply = await generateChatResponse(
           botMeta,

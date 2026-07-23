@@ -62,7 +62,7 @@ async function callOpenRouterChat({
 
 const INTENT_PATTERNS = {
   greeting:
-    /^(hi|hello|hey|good morning|good evening|good afternoon|howdy|sup|greetings|你好|hola|bonjour|hallo|ciao)[!?.]*$/i,
+    /^(hi|hello|hey|good morning|good evening|good afternoon|howdy|sup|greetings|whats up|what's up|what up|how are you|how's it going|nice to meet you|good day|good night|thanks|thank you|thx|bye|goodbye|你好|hola|bonjour|hallo|ciao)([\s,]+(bud|buddy|friend|pal|man|bro|there|all))?[!?.]*$/i,
   product:
     /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|precio|comprar|价格|买|购买|producto|acheter|prix/i,
   contact:
@@ -80,6 +80,9 @@ async function detectIntent(message, options = {}) {
   const trimmed = message.trim();
 
   if (INTENT_PATTERNS.greeting.test(trimmed)) return "greeting";
+
+  const smalltalkPattern = /^(whats up|what's up|how are you|how is it going|how's it going|who are you|what can you do|who made you|nice to meet you|good day|thank you|thanks|thx|bye|goodbye)/i;
+  if (smalltalkPattern.test(trimmed)) return "greeting";
 
   const cjkCount = (
     trimmed.match(/[\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7a3]/g) || []
@@ -103,7 +106,7 @@ async function detectIntent(message, options = {}) {
         {
           role: "system",
           content:
-            "Classify the user's message into exactly ONE of these intents: product, contact, about, faq, navigation, general. Reply ONLY with the single word of the intent.",
+            "Classify the user's message into exactly ONE of these intents: greeting, product, contact, about, faq, navigation, general. Reply ONLY with the single word of the intent.",
         },
         { role: "user", content: trimmed },
       ],
@@ -116,6 +119,7 @@ async function detectIntent(message, options = {}) {
 
     const llmIntent = raw.toLowerCase().trim();
     const validIntents = [
+      "greeting",
       "product",
       "contact",
       "about",
@@ -236,10 +240,18 @@ async function generateChatResponse(
     content: basePrompt + langPrompt,
   };
 
-  const formattedHistory = chatHistory.map((msg) => ({
-    role: msg.role === "assistant" ? "assistant" : "user",
-    content: msg.content,
-  }));
+  const recentHistory = (chatHistory || []).slice(-4);
+  const formattedHistory = recentHistory.map((msg) => {
+    const isAssistant = msg.role === "assistant";
+    let content = msg.content || "";
+    if (isAssistant && content.length > 250) {
+      content = content.slice(0, 250) + "...";
+    }
+    return {
+      role: isAssistant ? "assistant" : "user",
+      content,
+    };
+  });
 
   try {
     const reply = await callOpenRouterChat({

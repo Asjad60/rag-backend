@@ -50,16 +50,33 @@ async function executeHybridSearch(collectionName, denseVector, sparseVector = {
     } catch (_) {}
   }
 
-  // 2. Retrieve Top 30 Sparse Matches (Stage J)
-  try {
-    // If sparse vector query supported in collection, search named vector / payload
-    sparseResults = await qdrantClient.search(collectionName, {
-      vector: denseVector, // Vector fallback or sparse vector if configured
-      limit: 30,
-      filter,
-      with_payload: true,
-    });
-  } catch (_) {}
+  // 2. Retrieve Top 30 Sparse Matches (Stage J - BM25 Term Frequency Search)
+  if (sparseVector && sparseVector.indices && sparseVector.indices.length > 0) {
+    try {
+      sparseResults = await qdrantClient.search(collectionName, {
+        vector: {
+          name: 'sparse_vector',
+          vector: {
+            indices: sparseVector.indices,
+            values: sparseVector.values,
+          },
+        },
+        limit: 30,
+        filter,
+        with_payload: true,
+      });
+    } catch (_) {
+      // Fallback: If named sparse vector search is not configured on collection, retry with dense vector keyword fallback
+      try {
+        sparseResults = await qdrantClient.search(collectionName, {
+          vector: denseVector,
+          limit: 30,
+          filter,
+          with_payload: true,
+        });
+      } catch (_) {}
+    }
+  }
 
   // 3. Apply Reciprocal Rank Fusion (RRF) (Stage K)
   const candidateMap = new Map();
