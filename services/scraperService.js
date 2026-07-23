@@ -1,278 +1,379 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
-const { URL } = require('url');
-const { v4: uuidv4 } = require('uuid');
-const { RecursiveCharacterTextSplitter } = require('@langchain/textsplitters');
-const { generateEmbeddings, EMBEDDING_DIM } = require('./embeddingService');
-const { qdrantClient } = require('../config/db');
+const axios = require("axios");
+const cheerio = require("cheerio");
+const { URL } = require("url");
+const { EMBEDDING_DIM } = require("./embeddingService");
+const { qdrantClient } = require("../config/db");
+const { processPageForIngestion } = require("./ingestionService");
+const Document = require("../models/Document");
 
-const COLLECTION_NAME = 'documents';
-const MAX_CRAWL_PAGES = 15; // Max pages to crawl per domain
+const MAX_CRAWL_PAGES = 500;
+const PAGE_CONCURRENCY = 5; // pages scraped in parallel per batch
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
+// ─── Per-Bot Collection Naming ────────────────────────────────────────────────
 
-/**
- * Detects the page type based on the URL path and page content.
- */
-function detectPageType(urlString, $) {
-  const path = new URL(urlString).pathname.toLowerCase();
-  const bodyText = $('body').text().toLowerCase();
-
-  if (/contact|reach-us|get-in-touch|support/.test(path)) return 'contact_page';
-  if (/about|company|team|who-we-are|our-story/.test(path)) return 'about_page';
-  if (/product|shop|store|catalog|item|sku/.test(path)) return 'product_page';
-  if (/service|solution|offering/.test(path)) return 'service_page';
-  if (/faq|help|knowledge|support/.test(path)) return 'faq_page';
-  if (/blog|article|news|post/.test(path)) return 'blog_page';
-  if (/pricing|plan|subscription/.test(path)) return 'pricing_page';
-  if (path === '/' || path === '') return 'homepage';
-
-  // Fallback: check content signals
-  if (/contact us|get in touch|send us a message/.test(bodyText)) return 'contact_page';
-  if (/frequently asked questions|faq/.test(bodyText)) return 'faq_page';
-  return 'general_page';
+function getCollectionName(botId) {
+  return `bot_${botId.toString()}`;
 }
 
-/**
- * Extracts contact information from the page (email, phone, address).
- */
-function extractContactInfo($) {
-  const bodyText = $('body').text();
-  const emailMatches = bodyText.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g) || [];
-  const phoneMatches = bodyText.match(/(\+?\d[\d\s\-().]{7,}\d)/g) || [];
+// ─── Link Discovery Utilities ────────────────────────────────────────────────
 
-  return {
-    emails: [...new Set(emailMatches)].slice(0, 5),
-    phones: [...new Set(phoneMatches.map(p => p.trim()))].slice(0, 5),
-  };
-}
-
-/**
- * Extracts clean, structured text from a Cheerio-loaded page.
- */
-function extractPageText($) {
-  $('script, style, noscript, iframe, svg, nav, footer, [class*="cookie"], [class*="popup"]').remove();
-
-  let rawText = '';
-  // Walk headings, paragraphs, list items, table cells
-  $('h1, h2, h3, h4, h5, h6').each((_, el) => {
-    rawText += `\n## ${$(el).text().trim()}\n`;
-  });
-  $('p, li, td, th, blockquote, figcaption, address, dt, dd').each((_, el) => {
-    const t = $(el).text().trim();
-    if (t.length > 20) rawText += t + '\n';
-  });
-
-  if (!rawText.trim()) {
-    rawText = $('body').text().replace(/\s+/g, ' ').trim();
-  }
-  return rawText.trim();
-}
-
-/**
- * Collects internal links from a page, up to `limit`.
- */
-function collectInternalLinks($, baseUrl, limit = 20) {
+function collectInternalLinks($, baseUrl, limit = 30) {
   const base = new URL(baseUrl);
   const links = new Set();
-  $('a[href]').each((_, el) => {
+  $("a[href]").each((_, el) => {
     try {
-      const href = $(el).attr('href');
+      const href = $(el).attr("href");
       const resolved = new URL(href, baseUrl);
       if (resolved.hostname === base.hostname) {
-        resolved.hash = '';
-        resolved.search = ''; // ignore query params for dedup
+        resolved.hash = "";
+        resolved.search = "";
         links.add(resolved.toString());
       }
-    } catch (_) { /* invalid URL */ }
+    } catch (_) {}
   });
   return [...links].slice(0, limit);
 }
 
-// ─── Qdrant Collection Setup ──────────────────────────────────────────────────
+// ─── Sitemap Discovery ────────────────────────────────────────────────────────
 
-async function ensureCollection() {
-  let collectionExists = false;
+async function fetchSitemapXml(sitemapUrl, origin, depth = 0) {
+  if (depth > 1) return [];
   try {
-    const info = await qdrantClient.getCollection(COLLECTION_NAME);
-    collectionExists = true;
-    // Check if existing collection has the wrong vector size
+    const res = await axios.get(sitemapUrl, {
+      timeout: 10_000,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)",
+        Accept: "application/xml, text/xml, */*",
+      },
+    });
+
+    const $ = cheerio.load(res.data, { xmlMode: true });
+    const urls = [];
+
+    const childLocs = $("sitemapindex sitemap loc").toArray();
+    if (childLocs.length > 0) {
+      for (const el of childLocs.slice(0, 10)) {
+        const childUrl = $(el).text().trim();
+        const childUrls = await fetchSitemapXml(childUrl, origin, depth + 1);
+        urls.push(...childUrls);
+        if (urls.length >= MAX_CRAWL_PAGES * 2) break;
+      }
+      return urls;
+    }
+
+    $("urlset url loc").each((_, el) => {
+      const loc = $(el).text().trim();
+      try {
+        if (new URL(loc).hostname === new URL(origin).hostname) {
+          urls.push(loc);
+        }
+      } catch (_) {}
+    });
+
+    return urls;
+  } catch (_) {
+    return [];
+  }
+}
+
+async function discoverSitemapUrls(rootUrl) {
+  const base = new URL(rootUrl);
+  const origin = `${base.protocol}//${base.hostname}`;
+
+  for (const path of [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/xmlsitemap.php",
+  ]) {
+    const urls = await fetchSitemapXml(`${origin}${path}`, origin);
+    if (urls.length > 0) {
+      console.log(
+        `🗺️  Sitemap found: ${origin}${path} (${urls.length} raw URLs)`,
+      );
+      return urls;
+    }
+  }
+
+  try {
+    const robotsRes = await axios.get(`${origin}/robots.txt`, {
+      timeout: 8_000,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)" },
+    });
+    const sitemapLines = robotsRes.data
+      .split("\n")
+      .map((line) => line.match(/^Sitemap:\s*(.+)/i)?.[1]?.trim())
+      .filter(Boolean);
+
+    for (const sitemapUrl of sitemapLines) {
+      const urls = await fetchSitemapXml(sitemapUrl, origin);
+      if (urls.length > 0) {
+        console.log(
+          `🗺️  Sitemap via robots.txt: ${sitemapUrl} (${urls.length} raw URLs)`,
+        );
+        return urls;
+      }
+    }
+  } catch (_) {}
+
+  console.log("ℹ️  No sitemap found — will fall back to homepage link crawl");
+  return [];
+}
+
+// ─── Qdrant Multi-Tenant Collection Management ───────────────────────────────
+
+/**
+ * Ensures Qdrant collection exists with SQ8 int8 scalar quantization
+ * and multi-tenant HNSW payload indexing (user_id tenant index).
+ */
+async function ensureCollection(collectionName) {
+  let exists = false;
+  try {
+    const info = await qdrantClient.getCollection(collectionName);
+    exists = true;
     const existingSize = info.config?.params?.vectors?.size;
     if (existingSize && existingSize !== EMBEDDING_DIM) {
       console.warn(
-        `⚠️  Qdrant collection "${COLLECTION_NAME}" has dimension ${existingSize} but we need ${EMBEDDING_DIM}. ` +
-        `Deleting and recreating...`
+        `⚠️  Collection "${collectionName}" has wrong dimension (${existingSize} ≠ ${EMBEDDING_DIM}). Recreating...`,
       );
-      await qdrantClient.deleteCollection(COLLECTION_NAME);
-      collectionExists = false;
+      await qdrantClient.deleteCollection(collectionName);
+      exists = false;
     } else {
-      console.log(`✅ Qdrant collection "${COLLECTION_NAME}" verified (dim=${EMBEDDING_DIM})`);
+      console.log(
+        `✅ Collection "${collectionName}" verified (dim=${EMBEDDING_DIM})`,
+      );
     }
   } catch (e) {
-    // "Not Found" / "Not found" / 404 all mean the collection doesn't exist yet — that's fine
-    const msg = e.message || '';
-    if (!msg.toLowerCase().includes('not found') && !msg.includes('404')) {
-      console.error('Unexpected Qdrant error in getCollection:', msg);
+    const msg = e.message || "";
+    if (!msg.toLowerCase().includes("not found") && !msg.includes("404"))
+      throw e;
+  }
+
+  if (!exists) {
+    console.log(
+      `🔧 Creating Qdrant collection "${collectionName}" (dim=${EMBEDDING_DIM}, SQ8 int8 Quantization)...`,
+    );
+    await qdrantClient.createCollection(collectionName, {
+      vectors: { size: EMBEDDING_DIM, distance: "Cosine" },
+      quantization_config: {
+        scalar: {
+          type: "int8",
+          quantile: 0.99,
+          always_ram: true,
+        },
+      },
+    });
+
+    // Multi-tenant HNSW payload index on user_id
+    try {
+      await qdrantClient.createPayloadIndex(collectionName, {
+        field_name: "user_id",
+        field_schema: {
+          type: "keyword",
+          is_tenant: true,
+        },
+      });
+    } catch (_) {}
+
+    // Indexed payload fields
+    try {
+      await qdrantClient.createPayloadIndex(collectionName, {
+        field_name: "pageType",
+        field_schema: "keyword",
+      });
+    } catch (_) {}
+
+    console.log(
+      `✅ Qdrant Multi-Tenant collection "${collectionName}" created with SQ8 int8 scalar quantization`,
+    );
+  }
+}
+
+async function deleteCollection(botId) {
+  const collectionName = getCollectionName(botId);
+  try {
+    await qdrantClient.deleteCollection(collectionName);
+    console.log(`🗑️  Collection "${collectionName}" deleted`);
+  } catch (e) {
+    const msg = e.message || "";
+    if (msg.toLowerCase().includes("not found") || msg.includes("404")) {
+      console.log(
+        `ℹ️  Collection "${collectionName}" did not exist — nothing to delete`,
+      );
+    } else {
       throw e;
     }
-    collectionExists = false;
-  }
-
-  if (!collectionExists) {
-    // Create fresh collection with correct 1536-dim
-    console.log(`🔧 Creating Qdrant collection "${COLLECTION_NAME}" (dim=${EMBEDDING_DIM})...`);
-    await qdrantClient.createCollection(COLLECTION_NAME, {
-      vectors: { size: EMBEDDING_DIM, distance: 'Cosine' },
-    });
-    await qdrantClient.createPayloadIndex(COLLECTION_NAME, {
-      field_name: 'botId',
-      field_schema: 'keyword',
-    });
-    await qdrantClient.createPayloadIndex(COLLECTION_NAME, {
-      field_name: 'pageType',
-      field_schema: 'keyword',
-    });
-    console.log(`✅ Qdrant collection "${COLLECTION_NAME}" created (dim=${EMBEDDING_DIM})`);
   }
 }
 
-// ─── Scrape a Single Page ─────────────────────────────────────────────────────
-
-async function scrapePage(url) {
+async function fetchAndIngestPage(url, botId = null) {
   const response = await axios.get(url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; RAGBot/1.0)',
-      Accept: 'text/html',
+      "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)",
+      Accept: "text/html",
     },
-    timeout: 15000,
+    timeout: 15_000,
   });
-  const $ = cheerio.load(response.data);
-  const pageTitle = $('title').text().trim() || new URL(url).hostname;
-  const pageType = detectPageType(url, $);
-  const contactInfo = extractContactInfo($);
-  const rawText = extractPageText($);
-  return { $, pageTitle, pageType, contactInfo, rawText };
+
+  const rawHtml = response.data;
+  return await processPageForIngestion(rawHtml, url, { botId });
 }
 
-// ─── Main Export ──────────────────────────────────────────────────────────────
+// ─── Main Ingestion Pipeline Orchestrator ─────────────────────────────────────
 
-/**
- * Scrapes a URL (and crawls child pages on the same domain), chunks the text,
- * embeds each chunk with 1536-dim OpenAI vectors, and upserts to Qdrant.
- *
- * @param {string} botId  - MongoDB bot ID
- * @param {string} rootUrl - The root URL to start crawling from
- * @returns {Promise<{ success: boolean, chunksCount: number, pagesScraped: number, businessName: string }>}
- */
 async function scrapeAndStore(botId, rootUrl) {
-  await ensureCollection();
+  const collectionName = getCollectionName(botId);
+  await ensureCollection(collectionName);
 
-  const visited = new Set();
-  const queue = [rootUrl];
-  const points = [];
-  let pagesScraped = 0;
-  let businessName = '';
+  // Stage 1: URL Discovery
+  let urlQueue = await discoverSitemapUrls(rootUrl);
+  const usedSitemap = urlQueue.length > 0;
 
-  const splitter = new RecursiveCharacterTextSplitter({
-    chunkSize: 800,
-    chunkOverlap: 150,
-  });
-
-  while (queue.length > 0 && pagesScraped < MAX_CRAWL_PAGES) {
-    const url = queue.shift();
-    if (visited.has(url)) continue;
-    visited.add(url);
-
+  if (!usedSitemap) {
+    console.log("🔗 Discovering URLs via homepage link crawl...");
     try {
-      console.log(`🕷️  Scraping [${pagesScraped + 1}/${MAX_CRAWL_PAGES}]: ${url}`);
-      const { $, pageTitle, pageType, contactInfo, rawText } = await scrapePage(url);
+      const homeRes = await axios.get(rootUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)",
+          Accept: "text/html",
+        },
+        timeout: 15_000,
+      });
+      const $raw = cheerio.load(homeRes.data);
+      $raw("script, style, noscript, iframe").remove();
 
-      // Auto-extract business name from homepage
-      if (pagesScraped === 0) {
-        businessName = pageTitle.replace(/\s*[-|–]\s*.+$/, '').trim(); // strip tagline
-      }
-
-      if (!rawText.trim()) {
-        console.warn(`  ↳ No text found, skipping`);
-        pagesScraped++;
-        continue;
-      }
-
-      // Queue internal links from first page only (avoids explosion)
-      if (pagesScraped === 0) {
-        const internalLinks = collectInternalLinks($, url, MAX_CRAWL_PAGES - 1);
-        for (const link of internalLinks) {
-          if (!visited.has(link)) queue.push(link);
-        }
-      }
-
-      // Chunk the text
-      const docChunks = await splitter.createDocuments([rawText]);
-
-      // Build contact info summary string to prepend to contact pages
-      let contactSummary = '';
-      if (contactInfo.emails.length || contactInfo.phones.length) {
-        contactSummary =
-          `Contact Information:\n` +
-          (contactInfo.emails.length ? `Emails: ${contactInfo.emails.join(', ')}\n` : '') +
-          (contactInfo.phones.length ? `Phone numbers: ${contactInfo.phones.join(', ')}\n` : '');
-      }
-
-      // Embed chunks in batches of 5 to stay within rate limits
-      const BATCH_SIZE = 5;
-      for (let i = 0; i < docChunks.length; i += BATCH_SIZE) {
-        const batch = docChunks.slice(i, i + BATCH_SIZE);
-        const batchPoints = await Promise.all(
-          batch.map(async (doc) => {
-            const chunkText = doc.pageContent;
-            // Prepend contact summary to every chunk of a contact page so retrieval is reliable
-            const textToEmbed =
-              pageType === 'contact_page' && contactSummary
-                ? `${contactSummary}\n${chunkText}`
-                : chunkText;
-
-            const vector = await generateEmbeddings(textToEmbed);
-            return {
-              id: uuidv4(),
-              vector,
-              payload: {
-                botId: botId.toString(),
-                url,
-                pageTitle,
-                pageType,
-                contactEmails: contactInfo.emails,
-                contactPhones: contactInfo.phones,
-                text: textToEmbed,
-              },
-            };
-          })
-        );
-        points.push(...batchPoints);
-        // Small delay to respect rate limits
-        if (i + BATCH_SIZE < docChunks.length) {
-          await new Promise(r => setTimeout(r, 300));
-        }
-      }
-
-      pagesScraped++;
+      const internalLinks = collectInternalLinks(
+        $raw,
+        rootUrl,
+        MAX_CRAWL_PAGES,
+      );
+      urlQueue = [...new Set([rootUrl, ...internalLinks])];
+      console.log(`🔗 Discovered ${urlQueue.length} URLs from homepage`);
     } catch (err) {
-      console.error(`  ↳ Error scraping ${url}:`, err.message);
-      pagesScraped++;
+      console.warn("⚠️  Homepage link discovery failed:", err.message);
+      urlQueue = [rootUrl];
     }
   }
 
-  if (points.length === 0) {
-    throw new Error('No content could be extracted from the provided URL(s)');
+  urlQueue = [...new Set(urlQueue)].slice(0, MAX_CRAWL_PAGES);
+  console.log(
+    `📋 Queued ${urlQueue.length} URLs to process through RAG Ingestion Pipeline`,
+  );
+
+  // Stage 2: Batch Scraping & Ingestion Processing
+  const allPoints = [];
+  let pagesScraped = 0;
+  let businessName = "";
+  const visited = new Set();
+
+  for (
+    let i = 0;
+    i < urlQueue.length && pagesScraped < MAX_CRAWL_PAGES;
+    i += PAGE_CONCURRENCY
+  ) {
+    const batch = urlQueue
+      .slice(i, i + PAGE_CONCURRENCY)
+      .filter((u) => !visited.has(u));
+    if (!batch.length) continue;
+    batch.forEach((u) => visited.add(u));
+
+    const results = await Promise.allSettled(
+      batch.map((url) => fetchAndIngestPage(url, botId)),
+    );
+
+    for (let j = 0; j < results.length; j++) {
+      const url = batch[j];
+      const result = results[j];
+
+      if (result.status === "fulfilled" && result.value) {
+        const pageRes = result.value;
+
+        if (pageRes.skipped) {
+          console.log(
+            `⏩ [Skipped Page] ${url} — Reason: ${pageRes.skipReason}`,
+          );
+          await Document.findOneAndUpdate(
+            { botId, url },
+            {
+              status: "skipped",
+              skipReason: pageRes.skipReason,
+              qualityMetrics: pageRes.metrics,
+              scrapedAt: new Date(),
+            },
+            { upsert: true },
+          );
+          pagesScraped++;
+          continue;
+        }
+
+        const {
+          points,
+          pageTitle,
+          contextualSummary,
+          parentCount,
+          childCount,
+          metrics,
+        } = pageRes;
+
+        if (pagesScraped === 0 && pageTitle) {
+          businessName = pageTitle.replace(/\s*[-|–]\s*.+$/, "").trim();
+        }
+
+        allPoints.push(...points);
+        pagesScraped++;
+
+        // Log document completion in MongoDB
+        await Document.findOneAndUpdate(
+          { botId, url },
+          {
+            status: "completed",
+            contextualSummary,
+            qualityMetrics: metrics,
+            chunksCount: { parentChunks: parentCount, childChunks: childCount },
+            scrapedAt: new Date(),
+          },
+          { upsert: true },
+        );
+
+        console.log(
+          `✅ [${pagesScraped}/${urlQueue.length}] ${url} — ${points.length} child points (${parentCount} parent chunks)`,
+        );
+      } else {
+        console.warn(
+          `⚠️  [${pagesScraped + 1}/${urlQueue.length}] Ingestion Failed: ${url} — ${result.reason?.message}`,
+        );
+        await Document.findOneAndUpdate(
+          { botId, url },
+          { status: "failed", scrapedAt: new Date() },
+          { upsert: true },
+        );
+        pagesScraped++;
+      }
+    }
   }
 
-  // Upsert all points in batches of 100
+  if (allPoints.length === 0) {
+    throw new Error(
+      "No valid content could be extracted or passed quality gates from the provided URL(s)",
+    );
+  }
+
+  // Stage 3: Single-Transaction Batch Upsert to Qdrant Multi-Tenant Storage
   const UPSERT_BATCH = 100;
-  for (let i = 0; i < points.length; i += UPSERT_BATCH) {
-    await qdrantClient.upsert(COLLECTION_NAME, { points: points.slice(i, i + UPSERT_BATCH) });
+  for (let i = 0; i < allPoints.length; i += UPSERT_BATCH) {
+    await qdrantClient.upsert(collectionName, {
+      points: allPoints.slice(i, i + UPSERT_BATCH),
+    });
   }
 
-  console.log(`✅ Stored ${points.length} chunks from ${pagesScraped} pages for bot ${botId}`);
-  return { success: true, chunksCount: points.length, pagesScraped, businessName };
+  console.log(
+    `✅ Successfully upserted ${allPoints.length} points to Qdrant collection "${collectionName}"`,
+  );
+  return {
+    success: true,
+    chunksCount: allPoints.length,
+    pagesScraped,
+    businessName,
+  };
 }
 
-module.exports = { scrapeAndStore };
+module.exports = { scrapeAndStore, deleteCollection, getCollectionName };
