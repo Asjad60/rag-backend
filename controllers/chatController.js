@@ -25,7 +25,7 @@ const { executeRetrievalPipeline } = require("../services/retrievalService");
  */
 function buildContextText(searchResults) {
   if (!searchResults || searchResults.length === 0) return "";
-  const topResults = searchResults.slice(0, 3);
+  const topResults = searchResults.slice(0, 5);
   let context = topResults
     .map((r, i) => {
       const {
@@ -55,8 +55,8 @@ function buildContextText(searchResults) {
     })
     .join("\n\n---\n\n");
 
-  if (context.length > 6000) {
-    context = context.slice(0, 6000) + "\n...[truncated]";
+  if (context.length > 8000) {
+    context = context.slice(0, 8000) + "\n...[truncated]";
   }
   return context;
 }
@@ -215,8 +215,12 @@ exports.chat = async (req, res) => {
       resolvedParentChunks.length > 0 ? resolvedParentChunks : searchResults,
     );
     const chunksRetrieved = resolvedParentChunks.length;
+    console.log(
+      `📄 [Stage 4 Context Combined] ${chunksRetrieved} parent chunks | Context length: ${contextText.length} chars`,
+    );
 
     // ── Stage 5: LLM Generation (Grounded) ────────────────────────────────
+    console.log(`🤖 [Stage 5 LLM Generation] Sending query to OpenRouter...`);
     const fullHistory = [...chatHistory, { role: "user", content: message }];
     const reply = await generateChatResponse(
       botMeta,

@@ -1,4 +1,4 @@
-const { qdrantClient } = require('../../config/db');
+const { qdrantClient } = require("../../config/db");
 
 const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
 
@@ -15,10 +15,16 @@ const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
  * @param {string[]} allowedPageTypes - Optional page type filter array
  * @returns {Promise<Array>}        - RRF ranked list of candidate chunks
  */
-async function executeHybridSearch(collectionName, denseVector, sparseVector = { indices: [] }, allowedPageTypes = []) {
-  const filter = allowedPageTypes.length > 0
-    ? { must: [{ key: 'pageType', match: { any: allowedPageTypes } }] }
-    : undefined;
+async function executeHybridSearch(
+  collectionName,
+  denseVector,
+  sparseVector = { indices: [] },
+  allowedPageTypes = [],
+) {
+  const filter =
+    allowedPageTypes.length > 0
+      ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
+      : undefined;
 
   let denseResults = [];
   let sparseResults = [];
@@ -33,9 +39,9 @@ async function executeHybridSearch(collectionName, denseVector, sparseVector = {
       score_threshold: 0.15,
     });
   } catch (e) {
-    const msg = e.message || '';
-    if (!msg.toLowerCase().includes('not found') && !msg.includes('404')) {
-      console.error('❌ Qdrant dense search error:', e.message);
+    const msg = e.message || "";
+    if (!msg.toLowerCase().includes("not found") && !msg.includes("404")) {
+      console.error("❌ Qdrant dense search error:", e.message);
     }
   }
 
@@ -55,7 +61,7 @@ async function executeHybridSearch(collectionName, denseVector, sparseVector = {
     try {
       sparseResults = await qdrantClient.search(collectionName, {
         vector: {
-          name: 'sparse_vector',
+          name: "sparse_vector",
           vector: {
             indices: sparseVector.indices,
             values: sparseVector.values,
@@ -66,6 +72,7 @@ async function executeHybridSearch(collectionName, denseVector, sparseVector = {
         with_payload: true,
       });
     } catch (_) {
+      console.log("Sparse Search Error fallback to dense search");
       // Fallback: If named sparse vector search is not configured on collection, retry with dense vector keyword fallback
       try {
         sparseResults = await qdrantClient.search(collectionName, {
@@ -118,14 +125,16 @@ async function executeHybridSearch(collectionName, denseVector, sparseVector = {
   // Sort candidates by RRF score descending
   const rrfRankedCandidates = Array.from(candidateMap.values())
     .sort((a, b) => b.rrfScore - a.rrfScore)
-    .map(item => ({
+    .map((item) => ({
       ...item.point,
       rrfScore: parseFloat(item.rrfScore.toFixed(6)),
       denseRank: item.denseRank,
       sparseRank: item.sparseRank,
     }));
 
-  console.log(`🔀 [Hybrid Search & RRF] Merged ${denseResults.length} dense + ${sparseResults.length} sparse -> ${rrfRankedCandidates.length} unique candidates`);
+  console.log(
+    `🔀 [Hybrid Search & RRF] Merged ${denseResults.length} dense + ${sparseResults.length} sparse -> ${rrfRankedCandidates.length} unique candidates`,
+  );
 
   return rrfRankedCandidates;
 }

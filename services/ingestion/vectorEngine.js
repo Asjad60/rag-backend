@@ -100,8 +100,10 @@ async function vectorizeChunks(childChunks, url, options = {}) {
 
     return {
       id: pointId,
-      vector: denseVector, // 1536-dim dense vector
-      sparse_vector: sparseVector,
+      vector: {
+        '': denseVector, // 1536-dim dense vector
+        'sparse_vector': sparseVector, // BM25 sparse vector { indices, values }
+      },
       payload: {
         url,
         childIndex: chunk.childIndex,

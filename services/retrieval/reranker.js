@@ -112,7 +112,7 @@ async function bgeRerank(query, documents, options = {}) {
             Authorization: `Bearer ${hfApiKey}`,
             "Content-Type": "application/json",
           },
-          timeout: 10_000,
+          timeout: 30000,
         },
       );
       console.log("Hugging  face  api call success");
@@ -129,10 +129,15 @@ async function bgeRerank(query, documents, options = {}) {
         }).catch(() => {});
 
         return scores.map((item, index) => {
-          const score = typeof item === "number" ? item : (item.score ?? 0.5);
+          const rawScore = typeof item === "number" ? item : (item.score ?? 0.5);
+          // BGE reranker models output raw logit scores. Convert to [0, 1] via Sigmoid if unbounded.
+          const normalizedScore =
+            rawScore > 1.0 || rawScore < 0.0
+              ? 1.0 / (1.0 + Math.exp(-rawScore))
+              : rawScore;
           return {
             index,
-            relevanceScore: parseFloat(score.toFixed(4)),
+            relevanceScore: parseFloat(normalizedScore.toFixed(4)),
           };
         });
       }
@@ -156,7 +161,9 @@ async function crossEncoderLLMScoring(query, candidateChunks, options = {}) {
 
   const chunksText = candidateChunks
     .map(
-      (c, i) => `[CHUNK ${i + 1}]:\n${(c.payload?.text || "").slice(0, 400)}`,
+      // (c, i) => `[CHUNK ${i + 1}]:\n${(c.payload?.text || "").slice(0, 400)}`,
+      (c, i) =>
+        `[CHUNK ${i + 1} | Title: ${c.payload?.pageTitle || "Page"} | URL: ${c.payload?.url || ""}]:\n${(c.payload?.contextualText || c.payload?.text || "").slice(0, 1000)}`,
     )
     .join("\n\n---\n\n");
 
@@ -225,7 +232,21 @@ Reply ONLY with a JSON array of objects in this exact format:
 async function rerankCandidates(query, candidateChunks, options = {}) {
   if (!candidateChunks || candidateChunks.length === 0) return [];
 
-  const topCandidates = candidateChunks.slice(0, 10);
+  // Apply URL-level Diversity Filtering: max 2 child chunks per distinct page URL
+  // Guarantees multi-product/multi-page coverage so a single page doesn't crowd out other relevant pages
+  const parentCounts = new Map();
+  const diverseCandidates = [];
+
+  for (const candidate of candidateChunks) {
+    const parentKey = candidate.payload?.url || candidate.payload?.parentId || candidate.id;
+    const count = parentCounts.get(parentKey) || 0;
+    if (count < 2) {
+      parentCounts.set(parentKey, count + 1);
+      diverseCandidates.push(candidate);
+    }
+  }
+
+  const topCandidates = diverseCandidates.slice(0, 12);
   const docTexts = topCandidates.map(
     (c) => c.payload?.contextualText || c.payload?.text || "",
   );

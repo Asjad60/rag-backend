@@ -5,7 +5,9 @@ const DocumentSchema = new mongoose.Schema({
   url:               { type: String, required: true },
   status:            { type: String, enum: ['pending', 'processing', 'completed', 'failed', 'skipped'], default: 'pending' },
   skipReason:        { type: String, default: '' },
+  pageType:          { type: String, default: 'general_page' },
   contextualSummary: { type: String, default: '' },
+  normalizedText:    { type: String, default: '' },
   qualityMetrics:    {
     wordCount:       { type: Number, default: 0 },
     tableCount:      { type: Number, default: 0 },

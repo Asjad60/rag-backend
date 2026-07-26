@@ -66,6 +66,7 @@ async function processPageForIngestion(rawInput, url = '', options = {}) {
     skipped: false,
     pageTitle: normalized.pageTitle,
     pageType: normalized.pageType,
+    normalizedText: normalized.rawText,
     url,
     contextualSummary,
     parentCount: parentChunks.length,

@@ -131,15 +131,16 @@ async function ensureCollection(collectionName) {
     const info = await qdrantClient.getCollection(collectionName);
     exists = true;
     const existingSize = info.config?.params?.vectors?.size;
-    if (existingSize && existingSize !== EMBEDDING_DIM) {
+    const hasSparse = !!info.config?.sparse_vectors?.sparse_vector;
+    if ((existingSize && existingSize !== EMBEDDING_DIM) || !hasSparse) {
       console.warn(
-        `⚠️  Collection "${collectionName}" has wrong dimension (${existingSize} ≠ ${EMBEDDING_DIM}). Recreating...`,
+        `⚠️  Collection "${collectionName}" missing sparse vectors index or dimension mismatch. Recreating...`,
       );
       await qdrantClient.deleteCollection(collectionName);
       exists = false;
     } else {
       console.log(
-        `✅ Collection "${collectionName}" verified (dim=${EMBEDDING_DIM})`,
+        `✅ Collection "${collectionName}" verified (dim=${EMBEDDING_DIM}, sparse_vector enabled)`,
       );
     }
   } catch (e) {
@@ -150,10 +151,13 @@ async function ensureCollection(collectionName) {
 
   if (!exists) {
     console.log(
-      `🔧 Creating Qdrant collection "${collectionName}" (dim=${EMBEDDING_DIM}, SQ8 int8 Quantization)...`,
+      `🔧 Creating Qdrant collection "${collectionName}" (dim=${EMBEDDING_DIM}, Sparse BM25 Index, SQ8 int8 Quantization)...`,
     );
     await qdrantClient.createCollection(collectionName, {
       vectors: { size: EMBEDDING_DIM, distance: "Cosine" },
+      sparse_vectors: {
+        sparse_vector: {},
+      },
       quantization_config: {
         scalar: {
           type: "int8",
@@ -308,6 +312,8 @@ async function scrapeAndStore(botId, rootUrl) {
         const {
           points,
           pageTitle,
+          pageType,
+          normalizedText,
           contextualSummary,
           parentCount,
           childCount,
@@ -326,7 +332,9 @@ async function scrapeAndStore(botId, rootUrl) {
           { botId, url },
           {
             status: "completed",
+            pageType,
             contextualSummary,
+            normalizedText,
             qualityMetrics: metrics,
             chunksCount: { parentChunks: parentCount, childChunks: childCount },
             scrapedAt: new Date(),

@@ -1,6 +1,77 @@
 const { callOpenRouterChat } = require("../llmService");
 
 /**
+ * Extracts the most likely subject/topic from the last user or assistant turn.
+ * Used to resolve pronouns like "it", "this", "that" against recent context.
+ *
+ * @param {string} text - A single chat message
+ * @returns {string}    - Best candidate noun phrase, or ''
+ */
+function extractLastSubject(text) {
+  if (!text) return '';
+  const cleaned = text.trim();
+
+  // Look for quoted product/service names first
+  const quoted = cleaned.match(/["\u201c\u2018]([^"\u201d\u2019]{2,60})["\u201d\u2019]/);
+  if (quoted) return quoted[1].trim();
+
+  // "price of X", "cost of X", "details of X", "info on X"
+  const priceOf = cleaned.match(/\b(?:price|cost|details?|info(?:rmation)?|about|of|for)\s+(?:the\s+)?([A-Z][\w\s\-]{1,40})/i);
+  if (priceOf) return priceOf[1].trim();
+
+  // Capitalised noun phrases (likely product/service names): 2–5 consecutive title-case words
+  const titleCase = cleaned.match(/(?:[A-Z][\w\-]+(?:\s+[A-Z][\w\-]+){1,4})/);
+  if (titleCase) return titleCase[0].trim();
+
+  // Fall back to the last sentence's noun-ish tail (last 1-3 words, ignoring trailing punctuation)
+  const lastWords = cleaned.replace(/[.!?]+$/, '').split(/\s+/).slice(-3).join(' ');
+  return lastWords.length > 2 ? lastWords : '';
+}
+
+
+function resolveAmbiguousPronouns(query, chatHistory = []) {
+  const trimmed = (query || '').trim();
+  if (!trimmed || !chatHistory || chatHistory.length === 0) {
+    return { resolvedQuery: trimmed, wasResolved: false };
+  }
+
+  // Only act if the query actually contains ambiguous pronouns
+  const pronounPattern = /\b(it|this|that|they|them|its|their|these|those)\b/i;
+  if (!pronounPattern.test(trimmed)) {
+    return { resolvedQuery: trimmed, wasResolved: false };
+  }
+
+  // Walk history newest-first; prefer user turns (they name the product), then assistant turns
+  let subject = '';
+  const ordered = [...chatHistory].reverse();
+  for (const msg of ordered) {
+    if (!msg || !msg.content) continue;
+    const candidate = extractLastSubject(msg.content);
+    if (candidate && candidate.split(/\s+/).length <= 6) {
+      subject = candidate;
+      break;
+    }
+  }
+
+  if (!subject) {
+    return { resolvedQuery: trimmed, wasResolved: false };
+  }
+
+  // Replace all ambiguous standalone pronouns with the resolved subject
+  const resolved = trimmed.replace(
+    /\b(it|this|that|they|them|its|their|these|those)\b/gi,
+    subject,
+  );
+
+  if (resolved !== trimmed) {
+    console.log(`🔗 [Pronoun Resolution] "${trimmed}" → "${resolved}" (subject: "${subject}")`);
+    return { resolvedQuery: resolved, wasResolved: true };
+  }
+
+  return { resolvedQuery: trimmed, wasResolved: false };
+}
+
+/**
  * 1. Very short queries (<= 4 words)
  * 2. Ambiguous queries lacking specificity
  * 3. Missing context / reliance on chat history
@@ -48,21 +119,24 @@ function shouldRunHyDE(query, chatHistory = [], intent = "general") {
     return true;
   }
 
-  // Criterion 2 & 3: Ambiguous query / Missing context (pronouns, implicit follow-ups)
+  // Criterion 2 & 3: Ambiguous query / Missing context (pronouns, feedback/corrections, implicit follow-ups)
   const hasAmbiguousPronouns =
-    /\b(it|this|that|they|them|its|their|these|those|there)\b/i.test(trimmed);
+    /\b(it|this|that|they|them|its|their|these|those|there|you|your)\b/i.test(trimmed);
+  const hasCorrectionFeedback =
+    /\b(wrong|incorrect|invalid|error|showing the wrong|not right)\b/i.test(trimmed);
   const isQuestionWithoutSubject =
     /^(how|why|where|when|what|which|can i|is there|do you)\b/i.test(trimmed) &&
     wordCount < 8;
   const hasChatHistoryContext =
-    chatHistory && chatHistory.length > 0 && wordCount < 7;
+    chatHistory && chatHistory.length > 0 && wordCount < 10;
   if (
     hasAmbiguousPronouns ||
+    hasCorrectionFeedback ||
     isQuestionWithoutSubject ||
     hasChatHistoryContext
   ) {
     console.log(
-      "💡 [HyDE Triggered] Reason 2/3: Ambiguous query or missing context.",
+      "💡 [HyDE Triggered] Reason 2/3: Ambiguous query, feedback correction, or missing context.",
     );
     return true;
   }
@@ -162,4 +236,4 @@ Do NOT output greetings, preamble, or meta-comments. Output ONLY the raw hypothe
   }
 }
 
-module.exports = { generateHyDEAndExpandQuery, shouldRunHyDE };
+module.exports = { generateHyDEAndExpandQuery, shouldRunHyDE, resolveAmbiguousPronouns };

@@ -6,7 +6,7 @@ const LlmUsage = require("../models/LlmUsage");
 const PRICING_REGISTRY = {
   "openai/gpt-4o-mini": {
     inputPerToken: 0.15 / 1_000_000,
-    outputPerToken: 0.60 / 1_000_000,
+    outputPerToken: 0.6 / 1_000_000,
     cachePerToken: 0.075 / 1_000_000,
   },
   "openai/text-embedding-3-small": {
@@ -25,7 +25,7 @@ const PRICING_REGISTRY = {
   },
   default: {
     inputPerToken: 0.15 / 1_000_000,
-    outputPerToken: 0.60 / 1_000_000,
+    outputPerToken: 0.6 / 1_000_000,
     cachePerToken: 0.075 / 1_000_000,
   },
 };
@@ -91,9 +91,9 @@ async function logLlmUsage({
     });
 
     await usageRecord.save();
-    console.log(
-      `📊 [LLM Usage Logged] op="${operation}" | model="${modelName}" | in=${inTok} out=${outTok} cache=${cacheTok} | cost=$${totalCost.toFixed(6)}`,
-    );
+    // console.log(
+    //   `📊 [LLM Usage Logged] op="${operation}" | model="${modelName}" | in=${inTok} out=${outTok} cache=${cacheTok} | cost=$${totalCost.toFixed(6)}`,
+    // );
     return usageRecord;
   } catch (err) {
     console.error("⚠️  LLM Usage logging error (non-fatal):", err.message);
