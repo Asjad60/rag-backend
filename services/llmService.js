@@ -292,12 +292,26 @@ FORMATTING & STYLE GUIDELINES:
 - ONLY if the CONTEXT does not contain any facts about the requested topic/product, respond with: "I don't have specific details on that. ${fallback}"
 
 PRICING & PRODUCT COMPARISON RULES:
-- When listing or comparing multiple products, kits, models, or tiers, verify that EVERY price, specification, and feature is matched EXACTLY with its corresponding product name as stated in the context.
+- When listing or comparing multiple products, kits, models, or variants, verify that EVERY price, specification, and feature is matched EXACTLY with its corresponding product name as stated in the context.
 - NEVER mix up, transpose, or swap prices between different products or variants.
+- For comparison or differentiation questions, organize the response into clear sections:
+  1. 💡 **Key Differences** (Bullet points contrasting main attributes like price, material, size, usage)
+  2. 📋 **Product Specifications & Features** (Item-by-item feature breakdown)
+  3. 🎯 **Recommendation / Summary** (Who should buy which product)
 
-LINKING RULES — follow strictly:
-- The CONTEXT below contains RESULT blocks with "URL:" lines. Use those exact URLs when mentioning pages, products, or services: [Title](URL)
-- NEVER invent, guess, or construct a URL. Use ONLY URLs provided in the context.
+AVAILABILITY & VARIANT QUESTION RULES:
+- When a user asks about a specific size, color, or variant (or questions why a size is or isn't available):
+  1. Check the exact list of available sizes, colors, and stock in the CONTEXT for that product.
+  2. If the user's requested size or color is NOT listed in the context, state clearly: "According to our product details, [Product Name] is available in [list available sizes/colors from context], but [Requested Size/Color] is not listed as available."
+  3. DO NOT output the fallback message "I don't have specific details on that" if the product itself IS present in the context!
+
+LINKING & PRODUCT VERIFICATION RULES — follow strictly:
+- The CONTEXT below contains RESULT blocks with "Title:" and "URL:" lines.
+- When the user asks for a link, URL, or webpage link for a specific product (e.g., "give me the link", "show link"):
+  1. Find the RESULT block whose "Title:" matches the product discussed (e.g., "Sunscreen Jacket Ice Pro").
+  2. Extract that exact block's "URL:" and format the link as: [Product Name](URL) or [here](URL).
+  3. NEVER attach a URL from a different product's RESULT block!
+- State ONLY the exact sizes, colors, and features listed under that specific product's RESULT block. Never mix or substitute sizes/colors from a different product block.
 
 CONTEXT:
 ${contextText || "No context available."}`;

@@ -4,6 +4,7 @@ const { rerankCandidates } = require("./retrieval/reranker");
 const { generateEmbeddings } = require("./embeddingService");
 const { generateSparseVector } = require("./ingestion/vectorEngine");
 const { getCollectionName } = require("./scraperService");
+const { parseEcommerceQuery } = require("./retrieval/ecommerceQueryParser");
 
 const INTENT_PAGE_TYPE_FILTER = {
   product: ["product_page", "pricing_page", "service_page", "homepage"],
@@ -15,14 +16,15 @@ const INTENT_PAGE_TYPE_FILTER = {
 };
 
 /**
- * Stage D through O: Advanced Visitor Query Retrieval Pipeline.
+ * Stage D through O: Advanced Visitor Query Retrieval Pipeline with E-Commerce & Comparison Support.
  *
  * Pipeline Flow:
- *   1. Stage D: Query Context Expansion & HyDE
- *   2. Stage E-G: Dual Query Representations (1536-dim Dense + BM25 Sparse)
- *   3. Stage H-K: Qdrant Multi-Tenant Search & Reciprocal Rank Fusion (RRF)
- *   4. Stage L-N: 2nd-Stage Cohere Reranker (> 0.75 threshold) -> Top 5 Chunks
- *   5. Stage O: Resolve Matched Child Chunks to broader Parent Chunks
+ *   1. Stage D: E-Commerce Query Parsing (Zero-cost fast RegEx / LLM constraint extraction)
+ *   2. Stage D2: Query Context Expansion & HyDE
+ *   3. Stage E-G: Dual Query Representations (1536-dim Dense + BM25 Sparse)
+ *   4. Stage H-K: Qdrant Multi-Tenant Search with Numeric Price Filters & Balanced Comparison Retrieval
+ *   5. Stage L-N: 2nd-Stage Cohere Reranker (> 0.75 threshold) -> Top 5 Chunks
+ *   6. Stage O: Resolve Matched Child Chunks to broader Parent Chunks
  *
  * @param {string} botId       - Bot MongoDB ID
  * @param {string} query       - User query string
@@ -45,34 +47,79 @@ async function executeRetrievalPipeline(
 
   const cleanedQuery = (query || "").trim();
 
-  // Stage D-pre: Unconditional pronoun resolution (runs regardless of HyDE being enabled/disabled)
-  // const { resolvedQuery, wasResolved } = resolveAmbiguousPronouns(cleanedQuery, chatHistory);
-  // const baseQuery = wasResolved ? resolvedQuery : cleanedQuery;
+  // Stage D-pre: Resolve pronouns & implicit follow-up subjects (e.g. "give me the link" -> "Sunscreen Jacket Ice Pro give me the link")
+  const { resolvedQuery, wasResolved } = await resolveAmbiguousPronouns(cleanedQuery, chatHistory, opts);
+  const baseQuery = wasResolved ? resolvedQuery : cleanedQuery;
+
+  // Stage D0: E-Commerce Attribute & Comparison Parsing
+  const ecomConstraints = await parseEcommerceQuery(baseQuery, opts);
+
+  // Construct Qdrant extra payload filters (e.g. priceNumeric range)
+  let extraFilter = null;
+  if (ecomConstraints.maxPrice !== null) {
+    extraFilter = { key: "priceNumeric", range: { lte: ecomConstraints.maxPrice } };
+    console.log(`🏷️ [Qdrant Payload Filter] Applying price filter: priceNumeric <= ${ecomConstraints.maxPrice}`);
+  }
+
+  const targetSearchQuery = ecomConstraints.cleanSearchQuery || baseQuery;
 
   // Stage D: Query Context Expansion & HyDE
   const { hydeText, expandedQuery } = await generateHyDEAndExpandQuery(
-    cleanedQuery,
+    targetSearchQuery,
     chatHistory,
     opts,
   );
 
-  const denseQuery = hydeText && hydeText.length > 0 ? expandedQuery : cleanedQuery;
-  const sparseQuery = cleanedQuery;
+  const denseQuery = hydeText && hydeText.length > 0 ? expandedQuery : targetSearchQuery;
+  const sparseQuery = targetSearchQuery;
 
-  // Stage E, F, G: Dual Query Representations (Executed Concurrently)
-  const [denseVector, sparseVector] = await Promise.all([
-    generateEmbeddings(denseQuery, { ...opts, operation: "dense_embedding" }),
-    Promise.resolve(generateSparseVector(sparseQuery)),
-  ]);
-
-  // Stage H, I, J, K: Multi-Tenant Qdrant Hybrid Search & Reciprocal Rank Fusion (RRF)
   const allowedPageTypes = INTENT_PAGE_TYPE_FILTER[intent] ?? [];
-  const rrfCandidates = await executeHybridSearch(
-    collectionName,
-    denseVector,
-    sparseVector,
-    allowedPageTypes,
-  );
+  let rrfCandidates = [];
+
+  // Stage H-K: Multi-Product Comparison Retrieval (Decomposes "Product A vs Product B" into balanced sub-searches)
+  if (ecomConstraints.isComparison && ecomConstraints.comparisonEntities.length >= 2) {
+    console.log(`🔀 [Comparison Retrieval] Multi-entity comparison detected for: "${ecomConstraints.comparisonEntities.join(" vs ")}"`);
+    
+    // Execute balanced sub-retrievals for each compared entity concurrently
+    const subSearchResults = await Promise.all(
+      ecomConstraints.comparisonEntities.map(async (entity) => {
+        const subQuery = `${entity} product description price specs`;
+        const [dVec, sVec] = await Promise.all([
+          generateEmbeddings(subQuery, { ...opts, operation: "dense_embedding" }),
+          Promise.resolve(generateSparseVector(entity)),
+        ]);
+        return executeHybridSearch(collectionName, dVec, sVec, allowedPageTypes, extraFilter);
+      })
+    );
+
+    // Interleave candidate chunks to guarantee balanced context for both products
+    const candidateMap = new Map();
+    const maxLength = Math.max(...subSearchResults.map(r => r.length));
+    for (let i = 0; i < maxLength; i++) {
+      for (let j = 0; j < subSearchResults.length; j++) {
+        const item = subSearchResults[j][i];
+        if (item && !candidateMap.has(item.id)) {
+          candidateMap.set(item.id, item);
+        }
+      }
+    }
+    rrfCandidates = Array.from(candidateMap.values());
+    console.log(`🔀 [Comparison Retrieval] Interleaved ${rrfCandidates.length} balanced candidates across ${ecomConstraints.comparisonEntities.length} entities`);
+  } else {
+    // Standard Single-Query Hybrid Search
+    const [denseVector, sparseVector] = await Promise.all([
+      generateEmbeddings(denseQuery, { ...opts, operation: "dense_embedding" }),
+      Promise.resolve(generateSparseVector(sparseQuery)),
+    ]);
+
+    rrfCandidates = await executeHybridSearch(
+      collectionName,
+      denseVector,
+      sparseVector,
+      allowedPageTypes,
+      extraFilter,
+    );
+  }
 
   if (!rrfCandidates || rrfCandidates.length === 0) {
     return { searchResults: [], resolvedParentChunks: [], hydeText };

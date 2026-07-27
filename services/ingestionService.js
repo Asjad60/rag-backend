@@ -48,6 +48,7 @@ async function processPageForIngestion(rawInput, url = '', options = {}) {
     pageType: normalized.pageType,
     contactEmails: normalized.contactInfo.emails,
     contactPhones: normalized.contactInfo.phones,
+    ecommerceMeta: normalized.ecommerceMeta,
     url,
   };
 

@@ -116,6 +116,10 @@ async function vectorizeChunks(childChunks, url, options = {}) {
         contactEmails: chunk.contactEmails || [],
         contactPhones: chunk.contactPhones || [],
         tokenCount: chunk.tokenCount || 0,
+        priceNumeric: chunk.ecommerceMeta?.priceNumeric ?? null,
+        currency: chunk.ecommerceMeta?.currency || 'INR',
+        colors: chunk.ecommerceMeta?.colors || [],
+        sizes: chunk.ecommerceMeta?.sizes || [],
       },
     };
   });

@@ -572,11 +572,15 @@ function normalizePage(input, pageUrl = '') {
 
   const contentHash = crypto.createHash('sha256').update(rawText).digest('hex');
 
+  // Extract structured e-commerce metadata
+  const ecommerceMeta = extractEcommerceMetadata(rawText);
+
   return {
     url: pageUrl,
     pageTitle: pageTitle || 'Untitled Page',
     pageType,
     contactInfo,
+    ecommerceMeta,
     rawText,
     headers,
     metrics: {
@@ -586,6 +590,73 @@ function normalizePage(input, pageUrl = '') {
       headersCount: headers.length,
     },
     contentHash,
+  };
+}
+
+/**
+ * Extracts numeric price, currency, colors, and sizes from page text.
+ *
+ * @param {string} rawText
+ * @returns {{ priceNumeric: number|null, currency: string, colors: string[], sizes: string[] }}
+ */
+function extractEcommerceMetadata(rawText = '') {
+  let priceNumeric = null;
+  let currency = 'INR';
+
+  // Search for prices: e.g. "Price: USD 499", "Price: ₹500", "$49.99", "500 rupees"
+  const priceMatch = rawText.match(/(?:price|cost|msrp|pricing|rate|special price|now|was):\s*(?:(USD|EUR|GBP|INR|\$|₹|£|€)\s*)?([\d,]+(?:\.\d{1,2})?)/i) ||
+                     rawText.match(/(?:(USD|EUR|GBP|INR|\$|₹|£|€)\s*)([\d,]+(?:\.\d{1,2})?)/i) ||
+                     rawText.match(/\b([\d,]+(?:\.\d{1,2})?)\s*(?:rupees?|rs\.?|inr|bucks)\b/i);
+  if (priceMatch) {
+    const rawNum = (priceMatch[2] || priceMatch[1] || '').replace(/,/g, '');
+    const parsed = parseFloat(rawNum);
+    if (!isNaN(parsed) && parsed > 0 && parsed < 1000000) {
+      priceNumeric = parsed;
+      const symbolMatch = priceMatch[1] || '';
+      if (symbolMatch) {
+        const symbol = symbolMatch.toUpperCase();
+        if (symbol === '$') currency = 'USD';
+        else if (symbol === '₹') currency = 'INR';
+        else if (symbol === '€') currency = 'EUR';
+        else if (symbol === '£') currency = 'GBP';
+        else currency = symbol;
+      }
+    }
+  }
+
+  // Color extraction
+  const colors = [];
+  const colorList = ['black', 'white', 'red', 'blue', 'green', 'yellow', 'pink', 'purple', 'grey', 'gray', 'brown', 'navy', 'maroon', 'beige'];
+  colorList.forEach(c => {
+    if (new RegExp(`\\b${c}\\b`, 'i').test(rawText)) {
+      colors.push(c.toLowerCase());
+    }
+  });
+
+  // Size extraction (Alpha & Numeric: S, M, L, XL, 10, 42, 32, 8.5, UK 9, US 10)
+  const sizes = [];
+  const sizeList = ['S', 'M', 'L', 'XL', 'XXL', '3XL', 'Small', 'Medium', 'Large'];
+  sizeList.forEach(s => {
+    if (new RegExp(`\\b(?:size\\s+${s}|${s}\\s+size|size\\s*:\\s*${s})\\b`, 'i').test(rawText)) {
+      const norm = s.length <= 3 ? s.toUpperCase() : s;
+      if (!sizes.includes(norm)) sizes.push(norm);
+    }
+  });
+
+  // Numeric sizes (e.g. "Size: 10", "Size 42", "Waist 32", "Size 8.5", "UK 9", "US 10", "EU 42")
+  const numSizeMatches = rawText.matchAll(/\b(?:size|waist|uk|us|eu)\s*[:=]?\s*(\d{1,2}(?:\.\d)?)\b/gi);
+  for (const m of numSizeMatches) {
+    const szVal = m[1];
+    if (!sizes.includes(szVal)) {
+      sizes.push(szVal);
+    }
+  }
+
+  return {
+    priceNumeric,
+    currency,
+    colors: [...new Set(colors)],
+    sizes: [...new Set(sizes)],
   };
 }
 

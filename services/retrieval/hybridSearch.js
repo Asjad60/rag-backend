@@ -13,6 +13,7 @@ const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
  * @param {number[]} denseVector    - 1536-dim query embedding vector
  * @param {object}   sparseVector   - { indices, values } BM25 term indices
  * @param {string[]} allowedPageTypes - Optional page type filter array
+ * @param {object|array} extraFilter   - Optional additional Qdrant filters (e.g. price range, size, color)
  * @returns {Promise<Array>}        - RRF ranked list of candidate chunks
  */
 async function executeHybridSearch(
@@ -20,11 +21,21 @@ async function executeHybridSearch(
   denseVector,
   sparseVector = { indices: [] },
   allowedPageTypes = [],
+  extraFilter = null,
 ) {
-  const filter =
-    allowedPageTypes.length > 0
-      ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
-      : undefined;
+  const mustConditions = [];
+  if (allowedPageTypes.length > 0) {
+    mustConditions.push({ key: "pageType", match: { any: allowedPageTypes } });
+  }
+  if (extraFilter) {
+    if (Array.isArray(extraFilter)) {
+      mustConditions.push(...extraFilter);
+    } else {
+      mustConditions.push(extraFilter);
+    }
+  }
+
+  const filter = mustConditions.length > 0 ? { must: mustConditions } : undefined;
 
   let denseResults = [];
   let sparseResults = [];
@@ -45,7 +56,23 @@ async function executeHybridSearch(
     }
   }
 
-  // Fallback: if dense search with pageType filter returned 0, retry without filter
+  // Fallback 1: If dense search with strict extra filter returned 0, retry with pageType filter only
+  if (denseResults.length === 0 && extraFilter) {
+    console.log("⚠️ [Hybrid Search] Strict payload filter returned 0 points — falling back to pageType filter");
+    const fallbackFilter = allowedPageTypes.length > 0
+      ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
+      : undefined;
+    try {
+      denseResults = await qdrantClient.search(collectionName, {
+        vector: denseVector,
+        limit: 30,
+        filter: fallbackFilter,
+        with_payload: true,
+      });
+    } catch (_) {}
+  }
+
+  // Fallback 2: if dense search still returned 0, retry without any filter
   if (denseResults.length === 0 && allowedPageTypes.length > 0) {
     try {
       denseResults = await qdrantClient.search(collectionName, {
