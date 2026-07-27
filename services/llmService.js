@@ -62,9 +62,9 @@ async function callOpenRouterChat({
 
 const INTENT_PATTERNS = {
   greeting:
-    /^(hi|hello|hey|good morning|good evening|good afternoon|howdy|sup|greetings|whats up|what's up|what up|how are you|how's it going|nice to meet you|good day|good night|thanks|thank you|thx|bye|goodbye|你好|hola|bonjour|hallo|ciao)([\s,]+(bud|buddy|friend|pal|man|bro|there|all))?[!?.]*$/i,
+    /^(hi|hello|hey|good morning|good evening|good afternoon|howdy|sup|greetings|whats up|what's up|what up|how are you|how's it going|nice to meet you|good day|good night|thanks|thank you|thx|bye|goodbye|great|awesome|perfect|cool|ok|okay|nice|你好|hola|bonjour|hallo|ciao)([\s,]+(bud|buddy|friend|pal|man|bro|there|all))?[!?.]*$/i,
   product:
-    /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|precio|comprar|价格|买|购买|producto|acheter|prix/i,
+    /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|recommendation|recommend|suggest|suggestion|option|choice|variant|difference|diff|precio|comprar|价格|买|购买|producto|acheter|prix/i,
   contact:
     /contact|email|phone|call|reach|address|location|whatsapp|support|help desk|get in touch|contacto|联系|电话|邮箱/i,
   about:
@@ -78,26 +78,34 @@ const INTENT_PATTERNS = {
 
 async function detectIntent(message, options = {}) {
   const trimmed = message.trim();
+  const chatHistory = options.chatHistory || [];
 
   if (INTENT_PATTERNS.greeting.test(trimmed)) return "greeting";
 
-  const smalltalkPattern = /^(whats up|what's up|how are you|how is it going|how's it going|who are you|what can you do|who made you|nice to meet you|good day|thank you|thanks|thx|bye|goodbye)/i;
+  const smalltalkPattern = /^(whats up|what's up|how are you|how is it going|how's it going|who are you|what can you do|who made you|nice to meet you|good day|thank you|thanks|thx|bye|goodbye|great|awesome|perfect|cool|ok|okay|nice)/i;
   if (smalltalkPattern.test(trimmed)) return "greeting";
 
   const cjkCount = (
     trimmed.match(/[\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7a3]/g) || []
   ).length;
   const wordCount = trimmed.split(/\s+/).filter(Boolean).length + cjkCount;
-  const matchesKnownPattern = Object.entries(INTENT_PATTERNS)
-    .filter(([k]) => k !== "greeting")
-    .some(([, pattern]) => pattern.test(trimmed));
 
-  if (wordCount < 3 && !matchesKnownPattern) return "vague";
-
+  // Check pattern matches first
   for (const [intent, pattern] of Object.entries(INTENT_PATTERNS)) {
     if (intent === "greeting") continue;
     if (pattern.test(trimmed)) return intent;
   }
+
+  // If chatHistory is present, inherit product intent from recent turn for short follow-ups
+  if (chatHistory.length > 0) {
+    const lastUserTurn = [...chatHistory].reverse().find(m => m && m.role === 'user');
+    if (lastUserTurn && INTENT_PATTERNS.product.test(lastUserTurn.content || "")) {
+      return "product";
+    }
+  }
+
+  // Only return "vague" if there is NO chatHistory context
+  if (wordCount < 3 && chatHistory.length === 0) return "vague";
 
   // LLM Fallback via OpenRouter
   try {

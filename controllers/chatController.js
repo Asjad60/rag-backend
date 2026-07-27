@@ -93,7 +93,7 @@ exports.chat = async (req, res) => {
     const queryForRetrieval = translatedQuery;
 
     // ── Stage 2: Intent Router ────────────────────────────────────────────────
-    const intent = await detectIntent(queryForRetrieval, opts);
+    const intent = await detectIntent(queryForRetrieval, { ...opts, chatHistory });
     const branch = getRoutingBranch(intent);
     console.log(
       `🔀 [Router] intent="${intent}" → branch="${branch}" | lang="${detectedLang}"`,
