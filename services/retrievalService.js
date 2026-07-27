@@ -83,7 +83,7 @@ async function executeRetrievalPipeline(
     // Execute balanced sub-retrievals for each compared entity concurrently
     const subSearchResults = await Promise.all(
       ecomConstraints.comparisonEntities.map(async (entity) => {
-        const subQuery = `${entity} product description price specs`;
+        const subQuery = `${entity} product description price specs features`;
         const [dVec, sVec] = await Promise.all([
           generateEmbeddings(subQuery, { ...opts, operation: "dense_embedding" }),
           Promise.resolve(generateSparseVector(entity)),
