@@ -99,6 +99,35 @@ exports.chat = async (req, res) => {
       `🔀 [Router] intent="${intent}" → branch="${branch}" | lang="${detectedLang}"`,
     );
 
+    // ── Branch: Gratitude ─────────────────────────────────────────────────────
+    if (branch === "gratitude") {
+      let reply = `Glad I could help! Let me know if there's anything else I can help you with regarding ${bot.businessName || "our products"}.`;
+      if (isNonEnglish) {
+        reply = await generateChatResponse(
+          botMeta,
+          `System Instruction: Translate the following warm acknowledgment to ${langName} and return ONLY the translation:\n\n${reply}`,
+          [],
+          "gratitude",
+          langName,
+          opts
+        );
+      }
+      logChatEvent({
+        botId,
+        sessionId,
+        detectedLang,
+        isNonEnglish,
+        intent: "gratitude",
+        ragPath: "gratitude",
+        queryText: message,
+        translatedQuery: queryForRetrieval,
+        replyText: reply,
+        chunksRetrieved: 0,
+        guardrailFired: false,
+      });
+      return res.json({ reply, intent: "gratitude", detectedLang });
+    }
+
     // ── Branch: Greeting ──────────────────────────────────────────────────────
     if (branch === "greeting") {
       let reply = "";
@@ -107,18 +136,20 @@ exports.chat = async (req, res) => {
         .replace(/[,!?.']/g, " ")
         .trim();
 
-      if (/thanks|thank you|thx|appreciate|thank/i.test(textToMatch)) {
-        reply = `You're very welcome! Let me know if there's anything else I can help you with regarding ${bot.businessName || "our website"}.`;
-      } else if (/bye|goodbye|see ya|cya|farewell/i.test(textToMatch)) {
+      if (/bye|goodbye|see ya|cya|farewell/i.test(textToMatch)) {
         reply = `Goodbye! Have a great day!`;
       } else if (/whats up|what's up|sup|what up/i.test(textToMatch)) {
         reply = `Not much! I'm here to help you with any questions about ${bot.businessName || "this website"}. What can I help you find today?`;
       } else if (/how are you|how's it going|how do you do/i.test(textToMatch)) {
         reply = `I'm doing great, thank you! How can I assist you with ${bot.businessName || "this website"} today?`;
       } else {
-        reply =
-          bot.welcomeMessage ||
-          `Hi! I'm the AI assistant for ${bot.businessName || "this website"}. How can I help you today?`;
+        if (chatHistory && chatHistory.length > 0) {
+          reply = `Let me know if there's anything else I can help you find regarding ${bot.businessName || "our products"}!`;
+        } else {
+          reply =
+            bot.welcomeMessage ||
+            `Hi! I'm the AI assistant for ${bot.businessName || "this website"}. How can I help you today?`;
+        }
       }
       if (isNonEnglish) {
         reply = await generateChatResponse(
@@ -135,7 +166,7 @@ exports.chat = async (req, res) => {
         sessionId,
         detectedLang,
         isNonEnglish,
-        intent,
+        intent: "greeting",
         ragPath: "greeting",
         queryText: message,
         translatedQuery: queryForRetrieval,
@@ -143,7 +174,7 @@ exports.chat = async (req, res) => {
         chunksRetrieved: 0,
         guardrailFired: false,
       });
-      return res.json({ reply, intent, detectedLang });
+      return res.json({ reply, intent: "greeting", detectedLang });
     }
 
     // ── Stage 5 (pre-LLM): Guardrails ────────────────────────────────────────

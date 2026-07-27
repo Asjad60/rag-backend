@@ -62,7 +62,9 @@ async function callOpenRouterChat({
 
 const INTENT_PATTERNS = {
   greeting:
-    /^(hi|hello|hey|good morning|good evening|good afternoon|howdy|sup|greetings|whats up|what's up|what up|how are you|how's it going|nice to meet you|good day|good night|thanks|thank you|thx|bye|goodbye|great|awesome|perfect|cool|ok|okay|nice|你好|hola|bonjour|hallo|ciao)([\s,]+(bud|buddy|friend|pal|man|bro|there|all))?[!?.]*$/i,
+    /^(hi|hello|hey|good morning|good evening|good afternoon|howdy|sup|greetings|whats up|what's up|what up|how are you|how's it going|nice to meet you|good day|你好|hola|bonjour|hallo|ciao)([\s,]+(bud|buddy|friend|pal|man|bro|there|all))?[!?.]*$/i,
+  gratitude:
+    /^(thanks|thank you|thx|appreciate|thank|great|awesome|perfect|cool|ok|okay|nice|sounds good|got it|thank\s*you\s*so\s*much|thanks\s*a\s*lot)[!?.]*$/i,
   product:
     /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|recommendation|recommend|suggest|suggestion|option|choice|variant|difference|diff|precio|comprar|价格|买|购买|producto|acheter|prix/i,
   contact:
@@ -80,9 +82,10 @@ async function detectIntent(message, options = {}) {
   const trimmed = message.trim();
   const chatHistory = options.chatHistory || [];
 
+  if (INTENT_PATTERNS.gratitude.test(trimmed)) return "gratitude";
   if (INTENT_PATTERNS.greeting.test(trimmed)) return "greeting";
 
-  const smalltalkPattern = /^(whats up|what's up|how are you|how is it going|how's it going|who are you|what can you do|who made you|nice to meet you|good day|thank you|thanks|thx|bye|goodbye|great|awesome|perfect|cool|ok|okay|nice)/i;
+  const smalltalkPattern = /^(whats up|what's up|how are you|how is it going|how's it going|who are you|what can you do|who made you|nice to meet you|good day)/i;
   if (smalltalkPattern.test(trimmed)) return "greeting";
 
   const cjkCount = (
@@ -92,7 +95,7 @@ async function detectIntent(message, options = {}) {
 
   // Check pattern matches first
   for (const [intent, pattern] of Object.entries(INTENT_PATTERNS)) {
-    if (intent === "greeting") continue;
+    if (intent === "greeting" || intent === "gratitude") continue;
     if (pattern.test(trimmed)) return intent;
   }
 
@@ -114,7 +117,7 @@ async function detectIntent(message, options = {}) {
         {
           role: "system",
           content:
-            "Classify the user's message into exactly ONE of these intents: greeting, product, contact, about, faq, navigation, general. Reply ONLY with the single word of the intent.",
+            "Classify the user's message into exactly ONE of these intents: greeting, gratitude, product, contact, about, faq, navigation, general. Reply ONLY with the single word of the intent.",
         },
         { role: "user", content: trimmed },
       ],
@@ -128,6 +131,7 @@ async function detectIntent(message, options = {}) {
     const llmIntent = raw.toLowerCase().trim();
     const validIntents = [
       "greeting",
+      "gratitude",
       "product",
       "contact",
       "about",
@@ -150,6 +154,7 @@ async function detectIntent(message, options = {}) {
 
 function getRoutingBranch(intent) {
   if (intent === "greeting") return "greeting";
+  if (intent === "gratitude") return "gratitude";
   if (intent === "vague") return "clarify";
   if (intent === "product") return "product";
   return "semantic";
