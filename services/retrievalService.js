@@ -46,18 +46,18 @@ async function executeRetrievalPipeline(
   const cleanedQuery = (query || "").trim();
 
   // Stage D-pre: Unconditional pronoun resolution (runs regardless of HyDE being enabled/disabled)
-  const { resolvedQuery, wasResolved } = resolveAmbiguousPronouns(cleanedQuery, chatHistory);
-  const baseQuery = wasResolved ? resolvedQuery : cleanedQuery;
+  // const { resolvedQuery, wasResolved } = resolveAmbiguousPronouns(cleanedQuery, chatHistory);
+  // const baseQuery = wasResolved ? resolvedQuery : cleanedQuery;
 
   // Stage D: Query Context Expansion & HyDE
   const { hydeText, expandedQuery } = await generateHyDEAndExpandQuery(
-    baseQuery,
+    cleanedQuery,
     chatHistory,
     opts,
   );
 
-  const denseQuery = hydeText && hydeText.length > 0 ? expandedQuery : baseQuery;
-  const sparseQuery = baseQuery;
+  const denseQuery = hydeText && hydeText.length > 0 ? expandedQuery : cleanedQuery;
+  const sparseQuery = cleanedQuery;
 
   // Stage E, F, G: Dual Query Representations (Executed Concurrently)
   const [denseVector, sparseVector] = await Promise.all([
