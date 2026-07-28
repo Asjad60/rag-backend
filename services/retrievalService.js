@@ -1,11 +1,15 @@
-const { generateHyDEAndExpandQuery, resolveAmbiguousPronouns } = require("./retrieval/hydeService");
+const {
+  generateHyDEAndExpandQuery,
+  resolveAmbiguousPronouns,
+} = require("./retrieval/hydeService");
 const { executeHybridSearch } = require("./retrieval/hybridSearch");
-const { rerankCandidates, CONFIDENCE_ABSTENTION_THRESHOLD } = require("./retrieval/reranker");
+const {
+  rerankCandidates,
+  CONFIDENCE_ABSTENTION_THRESHOLD,
+} = require("./retrieval/reranker");
 const { generateEmbeddings } = require("./embeddingService");
-const { generateSparseVector } = require("./ingestion/vectorEngine");
 const { getCollectionName } = require("./scraperService");
 const { parseEcommerceQuery } = require("./retrieval/ecommerceQueryParser");
-const { loadCorpusStats } = require("./bm25StatsService");
 
 const INTENT_PAGE_TYPE_FILTER = {
   product: ["product_page", "pricing_page", "service_page", "homepage"],
@@ -49,18 +53,12 @@ async function executeRetrievalPipeline(
 
   const cleanedQuery = (query || "").trim();
 
-  // Load BM25 corpus statistics for this bot (5-min TTL cache).
-  // Enables true IDF-weighted sparse vectors at query time.
-  const corpusStats = await loadCorpusStats(botId);
-  if (corpusStats) {
-    const vocabSize = Object.keys(corpusStats.termDf || {}).length;
-    console.log(`📊 [BM25] Corpus stats loaded: N=${corpusStats.totalChunks} chunks | vocab=${vocabSize} terms`);
-  } else {
-    console.warn(`⚠️ [BM25] No TermStats found for bot=${botId} — falling back to TF-only sparse vectors`);
-  }
-
   // Stage D-pre: Resolve pronouns & implicit follow-up subjects (e.g. "give me the link" -> "Sunscreen Jacket Ice Pro give me the link")
-  const { resolvedQuery, wasResolved } = await resolveAmbiguousPronouns(cleanedQuery, chatHistory, opts);
+  const { resolvedQuery, wasResolved } = await resolveAmbiguousPronouns(
+    cleanedQuery,
+    chatHistory,
+    opts,
+  );
   const baseQuery = wasResolved ? resolvedQuery : cleanedQuery;
 
   // Stage D0: E-Commerce Attribute & Comparison Parsing
@@ -69,8 +67,13 @@ async function executeRetrievalPipeline(
   // Construct Qdrant extra payload filters (e.g. priceNumeric range)
   let extraFilter = null;
   if (ecomConstraints.maxPrice !== null) {
-    extraFilter = { key: "priceNumeric", range: { lte: ecomConstraints.maxPrice } };
-    console.log(`🏷️ [Qdrant Payload Filter] Applying price filter: priceNumeric <= ${ecomConstraints.maxPrice}`);
+    extraFilter = {
+      key: "priceNumeric",
+      range: { lte: ecomConstraints.maxPrice },
+    };
+    console.log(
+      `🏷️ [Qdrant Payload Filter] Applying price filter: priceNumeric <= ${ecomConstraints.maxPrice}`,
+    );
   }
 
   const targetSearchQuery = ecomConstraints.cleanSearchQuery || baseQuery;
@@ -79,34 +82,47 @@ async function executeRetrievalPipeline(
   const { hydeText, expandedQuery } = await generateHyDEAndExpandQuery(
     targetSearchQuery,
     chatHistory,
-    { ...opts, wasResolved }
+    { ...opts, wasResolved },
   );
 
-  const denseQuery = hydeText && hydeText.length > 0 ? expandedQuery : targetSearchQuery;
+  const denseQuery =
+    hydeText && hydeText.length > 0 ? expandedQuery : targetSearchQuery;
   const sparseQuery = targetSearchQuery;
 
   const allowedPageTypes = INTENT_PAGE_TYPE_FILTER[intent] ?? [];
   let rrfCandidates = [];
 
   // Stage H-K: Multi-Product Comparison Retrieval (Decomposes "Product A vs Product B" into balanced sub-searches)
-  if (ecomConstraints.isComparison && ecomConstraints.comparisonEntities.length >= 2) {
-    console.log(`🔀 [Comparison Retrieval] Multi-entity comparison detected for: "${ecomConstraints.comparisonEntities.join(" vs ")}"`);
-    
+  if (
+    ecomConstraints.isComparison &&
+    ecomConstraints.comparisonEntities.length >= 2
+  ) {
+    console.log(
+      `🔀 [Comparison Retrieval] Multi-entity comparison detected for: "${ecomConstraints.comparisonEntities.join(" vs ")}"`,
+    );
+
     // Execute balanced sub-retrievals for each compared entity concurrently
     const subSearchResults = await Promise.all(
       ecomConstraints.comparisonEntities.map(async (entity) => {
         const subQuery = `${entity} product description price specs features`;
-        const [dVec, sVec] = await Promise.all([
-          generateEmbeddings(subQuery, { ...opts, operation: "dense_embedding" }),
-          Promise.resolve(generateSparseVector(entity, corpusStats)),
-        ]);
-        return executeHybridSearch(collectionName, dVec, sVec, allowedPageTypes, extraFilter);
-      })
+        const dVec = await generateEmbeddings(subQuery, {
+          ...opts,
+          operation: "dense_embedding",
+        });
+        // Pass entity name as sparse query text — Qdrant/bm25 handles tokenisation
+        return executeHybridSearch(
+          collectionName,
+          dVec,
+          entity,
+          allowedPageTypes,
+          extraFilter,
+        );
+      }),
     );
 
     // Interleave candidate chunks to guarantee balanced context for both products
     const candidateMap = new Map();
-    const maxLength = Math.max(...subSearchResults.map(r => r.length));
+    const maxLength = Math.max(...subSearchResults.map((r) => r.length));
     for (let i = 0; i < maxLength; i++) {
       for (let j = 0; j < subSearchResults.length; j++) {
         const item = subSearchResults[j][i];
@@ -116,18 +132,20 @@ async function executeRetrievalPipeline(
       }
     }
     rrfCandidates = Array.from(candidateMap.values());
-    console.log(`🔀 [Comparison Retrieval] Interleaved ${rrfCandidates.length} balanced candidates across ${ecomConstraints.comparisonEntities.length} entities`);
+    console.log(
+      `🔀 [Comparison Retrieval] Interleaved ${rrfCandidates.length} balanced candidates across ${ecomConstraints.comparisonEntities.length} entities`,
+    );
   } else {
     // Standard Single-Query Hybrid Search
-    const [denseVector, sparseVector] = await Promise.all([
-      generateEmbeddings(denseQuery, { ...opts, operation: "dense_embedding" }),
-      Promise.resolve(generateSparseVector(sparseQuery, corpusStats)),
-    ]);
+    const denseVector = await generateEmbeddings(denseQuery, {
+      ...opts,
+      operation: "dense_embedding",
+    });
 
     rrfCandidates = await executeHybridSearch(
       collectionName,
       denseVector,
-      sparseVector,
+      sparseQuery, // raw text — Qdrant/bm25 model applied server-side
       allowedPageTypes,
       extraFilter,
     );
@@ -141,7 +159,8 @@ async function executeRetrievalPipeline(
       isAbstained: true,
       topRelevanceScore: 0,
       abstentionReason: "no_candidates_retrieved",
-      abstentionMessage: "I could not find relevant information in our store catalog.",
+      abstentionMessage:
+        "I could not find relevant information in our store catalog.",
     };
   }
 
@@ -154,7 +173,9 @@ async function executeRetrievalPipeline(
 
   // Stage N2: Confidence / Abstention Gate
   const topScore = top5SelectedChunks[0]?.relevanceScore ?? 0;
-  const isAbstained = top5SelectedChunks.length === 0 || topScore < CONFIDENCE_ABSTENTION_THRESHOLD;
+  const isAbstained =
+    top5SelectedChunks.length === 0 ||
+    topScore < CONFIDENCE_ABSTENTION_THRESHOLD;
 
   if (isAbstained) {
     console.log(
@@ -167,7 +188,8 @@ async function executeRetrievalPipeline(
       isAbstained: true,
       topRelevanceScore: topScore,
       abstentionReason: "low_confidence_score",
-      abstentionMessage: "I could not find sufficiently relevant information in our knowledge base to answer your question accurately.",
+      abstentionMessage:
+        "I could not find sufficiently relevant information in our knowledge base to answer your question accurately.",
     };
   }
 

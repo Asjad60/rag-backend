@@ -3,8 +3,7 @@ const cheerio = require("cheerio");
 const { URL } = require("url");
 const { EMBEDDING_DIM } = require("./embeddingService");
 const { qdrantClient } = require("../config/db");
-const { processPageForChunks, vectorizePageChunks } = require("./ingestionService");
-const { CorpusStatsBuilder, saveTermStats, deleteTermStats } = require("./bm25StatsService");
+const { processPageForIngestion } = require("./ingestionService");
 const Document = require("../models/Document");
 
 const MAX_CRAWL_PAGES = 500;
@@ -157,7 +156,9 @@ async function ensureCollection(collectionName) {
     await qdrantClient.createCollection(collectionName, {
       vectors: { size: EMBEDDING_DIM, distance: "Cosine" },
       sparse_vectors: {
-        sparse_vector: {},
+        sparse_vector: {
+          modifier: "idf",
+        },
       },
       quantization_config: {
         scalar: {
@@ -203,22 +204,16 @@ async function deleteCollection(botId) {
   } catch (e) {
     const msg = e.message || "";
     if (msg.toLowerCase().includes("not found") || msg.includes("404")) {
-      console.log(`ℹ️  Collection "${collectionName}" did not exist — nothing to delete`);
+      console.log(
+        `ℹ️  Collection "${collectionName}" did not exist — nothing to delete`,
+      );
     } else {
       throw e;
     }
   }
-
-  // Delete BM25 corpus statistics and invalidate cache
-  await deleteTermStats(botId);
-  console.log(`🗑️  BM25 TermStats for bot=${botId} deleted`);
 }
 
-/**
- * Phase 1 helper: Fetch a page and process it through Stages B-H (no vectorization).
- * Returns chunk objects so the caller can build corpus statistics before vectorizing.
- */
-async function fetchAndChunkPage(url, botId = null) {
+async function fetchAndIngestPage(url, botId = null) {
   const response = await axios.get(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)",
@@ -228,32 +223,16 @@ async function fetchAndChunkPage(url, botId = null) {
   });
 
   const rawHtml = response.data;
-  return await processPageForChunks(rawHtml, url, { botId });
+  return await processPageForIngestion(rawHtml, url, { botId });
 }
 
-// ─── Main Ingestion Pipeline Orchestrator (Two-Phase BM25) ───────────────────
+// ─── Main Ingestion Pipeline Orchestrator ────────────────────────────────────
 
-/**
- * Two-Phase RAG Ingestion Pipeline with True BM25:
- *
- * Phase 1 — Corpus Collection:
- *   Scrape all pages concurrently, normalize, quality-gate, and chunk.
- *   Accumulate term document frequencies (df) across ALL chunks using
- *   CorpusStatsBuilder. Save final corpus stats to MongoDB (TermStats).
- *
- * Phase 2 — Vectorization:
- *   Vectorize all collected chunks using the COMPLETE corpus statistics,
- *   so every IDF weight reflects the true corpus-wide term distribution.
- *   Batch-upsert resulting Qdrant points.
- *
- * This two-pass design is required for correct BM25 — IDF must be computed
- * after seeing all documents, not page by page.
- */
 async function scrapeAndStore(botId, rootUrl) {
   const collectionName = getCollectionName(botId);
   await ensureCollection(collectionName);
 
-  // ── URL Discovery ────────────────────────────────────────────────────────
+  // Stage 1: URL Discovery
   let urlQueue = await discoverSitemapUrls(rootUrl);
   const usedSitemap = urlQueue.length > 0;
 
@@ -261,12 +240,19 @@ async function scrapeAndStore(botId, rootUrl) {
     console.log("🔗 Discovering URLs via homepage link crawl...");
     try {
       const homeRes = await axios.get(rootUrl, {
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)", Accept: "text/html" },
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)",
+          Accept: "text/html",
+        },
         timeout: 15_000,
       });
       const $raw = cheerio.load(homeRes.data);
       $raw("script, style, noscript, iframe").remove();
-      const internalLinks = collectInternalLinks($raw, rootUrl, MAX_CRAWL_PAGES);
+      const internalLinks = collectInternalLinks(
+        $raw,
+        rootUrl,
+        MAX_CRAWL_PAGES,
+      );
       urlQueue = [...new Set([rootUrl, ...internalLinks])];
       console.log(`🔗 Discovered ${urlQueue.length} URLs from homepage`);
     } catch (err) {
@@ -276,63 +262,95 @@ async function scrapeAndStore(botId, rootUrl) {
   }
 
   urlQueue = [...new Set(urlQueue)].slice(0, MAX_CRAWL_PAGES);
-  console.log(`📋 Queued ${urlQueue.length} URLs | Two-Phase BM25 Ingestion Pipeline`);
+  console.log(
+    `📋 Queued ${urlQueue.length} URLs | Native BM25 Ingestion Pipeline`,
+  );
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // PHASE 1: Scrape all pages → collect chunks → build corpus statistics
-  // ═══════════════════════════════════════════════════════════════════════
-  console.log(`\n📥 [Phase 1] Scraping & chunking all pages to build BM25 corpus statistics...`);
-
-  const allPageResults  = [];  // { url, pageRes } — successful pages for Phase 2
-  const statsBuilder    = new CorpusStatsBuilder();
-  let pagesScraped      = 0;
-  let businessName      = "";
-  const visited         = new Set();
+  // Stage 2: Batch Scraping & Ingestion
+  const allPoints = [];
+  let pagesScraped = 0;
+  let businessName = "";
+  const visited = new Set();
 
   for (
     let i = 0;
     i < urlQueue.length && pagesScraped < MAX_CRAWL_PAGES;
     i += PAGE_CONCURRENCY
   ) {
-    const batch = urlQueue.slice(i, i + PAGE_CONCURRENCY).filter(u => !visited.has(u));
+    const batch = urlQueue
+      .slice(i, i + PAGE_CONCURRENCY)
+      .filter((u) => !visited.has(u));
     if (!batch.length) continue;
-    batch.forEach(u => visited.add(u));
+    batch.forEach((u) => visited.add(u));
 
     const results = await Promise.allSettled(
-      batch.map(url => fetchAndChunkPage(url, botId)),
+      batch.map((url) => fetchAndIngestPage(url, botId)),
     );
 
     for (let j = 0; j < results.length; j++) {
-      const url    = batch[j];
+      const url = batch[j];
       const result = results[j];
 
       if (result.status === "fulfilled" && result.value) {
         const pageRes = result.value;
 
         if (pageRes.skipped) {
-          console.log(`⏩ [Skipped] ${url} — ${pageRes.skipReason}`);
+          console.log(
+            `⏩ [Skipped Page] ${url} — Reason: ${pageRes.skipReason}`,
+          );
           await Document.findOneAndUpdate(
             { botId, url },
-            { status: "skipped", skipReason: pageRes.skipReason, qualityMetrics: pageRes.metrics, scrapedAt: new Date() },
+            {
+              status: "skipped",
+              skipReason: pageRes.skipReason,
+              qualityMetrics: pageRes.metrics,
+              scrapedAt: new Date(),
+            },
             { upsert: true },
           );
           pagesScraped++;
           continue;
         }
 
-        // Capture business name from first successful page title
-        if (allPageResults.length === 0 && pageRes.pageTitle) {
-          businessName = pageRes.pageTitle.replace(/\s*[-|–]\s*.+$/, "").trim();
+        const {
+          points,
+          pageTitle,
+          pageType,
+          normalizedText,
+          contextualSummary,
+          parentCount,
+          childCount,
+          metrics,
+        } = pageRes;
+
+        if (pagesScraped === 0 && pageTitle) {
+          businessName = pageTitle.replace(/\s*[-|–]\s*.+$/, "").trim();
         }
 
-        // Accumulate chunks into BM25 corpus stats builder
-        statsBuilder.addChunks(pageRes.childChunks);
-        allPageResults.push({ url, pageRes });
+        allPoints.push(...points);
         pagesScraped++;
 
-        console.log(`  📄 [${pagesScraped}/${urlQueue.length}] Chunked: ${url} — ${pageRes.childChunks.length} child chunks`);
+        await Document.findOneAndUpdate(
+          { botId, url },
+          {
+            status: "completed",
+            pageType,
+            contextualSummary,
+            normalizedText,
+            qualityMetrics: metrics,
+            chunksCount: { parentChunks: parentCount, childChunks: childCount },
+            scrapedAt: new Date(),
+          },
+          { upsert: true },
+        );
+
+        console.log(
+          `✅ [${pagesScraped}/${urlQueue.length}] ${url} — ${points.length} child points (${parentCount} parent chunks)`,
+        );
       } else {
-        console.warn(`  ⚠️  [${pagesScraped + 1}/${urlQueue.length}] Scrape failed: ${url} — ${result.reason?.message}`);
+        console.warn(
+          `⚠️  [${pagesScraped + 1}/${urlQueue.length}] Ingestion Failed: ${url} — ${result.reason?.message}`,
+        );
         await Document.findOneAndUpdate(
           { botId, url },
           { status: "failed", scrapedAt: new Date() },
@@ -343,60 +361,13 @@ async function scrapeAndStore(botId, rootUrl) {
     }
   }
 
-  if (allPageResults.length === 0) {
-    throw new Error("No valid content could be extracted or passed quality gates from the provided URL(s)");
-  }
-
-  // ── Finalize & persist corpus statistics ─────────────────────────────────
-  const corpusStats = statsBuilder.build();
-  await saveTermStats(botId, corpusStats);
-
-  const vocabSize  = Object.keys(corpusStats.termDf).length;
-  const avgDocLen  = corpusStats.totalChunks > 0
-    ? (corpusStats.totalTokens / corpusStats.totalChunks).toFixed(1)
-    : '0';
-  console.log(`\n📊 [BM25 Corpus Stats] N=${corpusStats.totalChunks} chunks | avgdl=${avgDocLen} tokens | vocab=${vocabSize} unique terms`);
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // PHASE 2: Vectorize all chunks with true BM25 corpus statistics
-  // ═══════════════════════════════════════════════════════════════════════
-  console.log(`\n⚡ [Phase 2] Vectorizing ${allPageResults.length} pages with true BM25 IDF...`);
-
-  const allPoints    = [];
-  const batchOptions = { botId };
-
-  for (const { url, pageRes } of allPageResults) {
-    const points = await vectorizePageChunks(
-      pageRes.childChunks,
-      url,
-      corpusStats,
-      batchOptions,
-    );
-    allPoints.push(...points);
-
-    // Log completed document to MongoDB with full chunk info
-    await Document.findOneAndUpdate(
-      { botId, url },
-      {
-        status:           "completed",
-        pageType:         pageRes.pageType,
-        contextualSummary: pageRes.contextualSummary,
-        normalizedText:   pageRes.normalizedText,
-        qualityMetrics:   pageRes.metrics,
-        chunksCount:      { parentChunks: pageRes.parentChunks.length, childChunks: pageRes.childChunks.length },
-        scrapedAt:        new Date(),
-      },
-      { upsert: true },
-    );
-
-    console.log(`  ✅ Vectorized: ${url} — ${points.length} BM25 Qdrant points`);
-  }
-
   if (allPoints.length === 0) {
-    throw new Error("Vectorization produced no valid Qdrant points.");
+    throw new Error(
+      "No valid content could be extracted or passed quality gates from the provided URL(s)",
+    );
   }
 
-  // ── Batch Upsert to Qdrant ────────────────────────────────────────────────
+  // Stage 3: Batch Upsert to Qdrant
   const UPSERT_BATCH = 100;
   for (let i = 0; i < allPoints.length; i += UPSERT_BATCH) {
     await qdrantClient.upsert(collectionName, {
@@ -404,9 +375,11 @@ async function scrapeAndStore(botId, rootUrl) {
     });
   }
 
-  console.log(`\n✅ Upserted ${allPoints.length} true-BM25 points to Qdrant collection "${collectionName}"`);
+  console.log(
+    `✅ Successfully upserted ${allPoints.length} points to Qdrant collection "${collectionName}" with native BM25 sparse vectors`,
+  );
   return {
-    success:     true,
+    success: true,
     chunksCount: allPoints.length,
     pagesScraped,
     businessName,

@@ -5,21 +5,24 @@ const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
 /**
  * Stage H, I, J, K: Execute Qdrant Multi-Tenant Search & Reciprocal Rank Fusion (RRF).
  *
- * Retrieves Top 30 Dense Vectors (1536-dim) and Top 30 Sparse Matches (BM25 term indices)
+ * Retrieves Top 30 Dense Vectors (1536-dim) and Top 30 Sparse Matches (native BM25)
  * filtered by collection (bot multi-tenant partition) and optional pageType,
- * then merges them using Reciprocal Rank Fusion (RRF).
+ * then merges them using Reciprocal Rank Fusion (RRF) in Node.js.
  *
- * @param {string}   collectionName - Bot Qdrant collection (bot_<botId>)
- * @param {number[]} denseVector    - 1536-dim query embedding vector
- * @param {object}   sparseVector   - { indices, values } BM25 term indices
- * @param {string[]} allowedPageTypes - Optional page type filter array
- * @param {object|array} extraFilter   - Optional additional Qdrant filters (e.g. price range, size, color)
- * @returns {Promise<Array>}        - RRF ranked list of candidate chunks
+ * Sparse BM25 search uses the Qdrant Universal Query API (.query()) with
+ * { text, model: 'Qdrant/bm25' } — Qdrant Cloud applies IDF weighting server-side.
+ *
+ * @param {string}   collectionName    - Bot Qdrant collection (bot_<botId>)
+ * @param {number[]} denseVector       - 1536-dim query embedding vector
+ * @param {string}   sparseQueryText   - Raw query text for native BM25 sparse search
+ * @param {string[]} allowedPageTypes  - Optional page type filter array
+ * @param {object|array} extraFilter   - Optional additional Qdrant filters (e.g. price range)
+ * @returns {Promise<Array>}           - RRF ranked list of candidate chunks
  */
 async function executeHybridSearch(
   collectionName,
   denseVector,
-  sparseVector = { indices: [] },
+  sparseQueryText = "",
   allowedPageTypes = [],
   extraFilter = null,
 ) {
@@ -35,7 +38,8 @@ async function executeHybridSearch(
     }
   }
 
-  const filter = mustConditions.length > 0 ? { must: mustConditions } : undefined;
+  const filter =
+    mustConditions.length > 0 ? { must: mustConditions } : undefined;
 
   let denseResults = [];
   let sparseResults = [];
@@ -58,10 +62,13 @@ async function executeHybridSearch(
 
   // Fallback 1: If dense search with strict extra filter returned 0, retry with pageType filter only
   if (denseResults.length === 0 && extraFilter) {
-    console.log("⚠️ [Hybrid Search] Strict payload filter returned 0 points — falling back to pageType filter");
-    const fallbackFilter = allowedPageTypes.length > 0
-      ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
-      : undefined;
+    console.log(
+      "⚠️ [Hybrid Search] Strict payload filter returned 0 points — falling back to pageType filter",
+    );
+    const fallbackFilter =
+      allowedPageTypes.length > 0
+        ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
+        : undefined;
     try {
       denseResults = await qdrantClient.search(collectionName, {
         vector: denseVector,
@@ -83,32 +90,27 @@ async function executeHybridSearch(
     } catch (_) {}
   }
 
-  // 2. Retrieve Top 30 Sparse Matches (Stage J - BM25 Term Frequency Search)
-  if (sparseVector && sparseVector.indices && sparseVector.indices.length > 0) {
+  // 2. Retrieve Top 30 Sparse Matches via Native Qdrant BM25 (Stage J)
+  if (sparseQueryText && sparseQueryText.trim().length > 0) {
     try {
-      sparseResults = await qdrantClient.search(collectionName, {
-        vector: {
-          name: "sparse_vector",
-          vector: {
-            indices: sparseVector.indices,
-            values: sparseVector.values,
-          },
+      const queryResult = await qdrantClient.query(collectionName, {
+        query: {
+          text: sparseQueryText.trim(),
+          model: "Qdrant/bm25",
         },
+        using: "sparse_vector",
         limit: 30,
         filter,
         with_payload: true,
       });
-    } catch (_) {
-      console.log("Sparse Search Error fallback to dense search");
-      // Fallback: If named sparse vector search is not configured on collection, retry with dense vector keyword fallback
-      try {
-        sparseResults = await qdrantClient.search(collectionName, {
-          vector: denseVector,
-          limit: 30,
-          filter,
-          with_payload: true,
-        });
-      } catch (_) {}
+      // .query() returns { points: [...] } — normalise to flat array
+      sparseResults = queryResult?.points ?? queryResult ?? [];
+    } catch (e) {
+      console.warn(
+        "⚠️ [Hybrid Search] Native BM25 sparse query failed — sparse leg skipped:",
+        e.message,
+      );
+      sparseResults = [];
     }
   }
 
