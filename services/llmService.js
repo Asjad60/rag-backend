@@ -111,7 +111,6 @@ async function detectIntent(message, options = {}) {
   if (wordCount < 3 && chatHistory.length === 0) return "vague";
 
   // LLM Fallback via OpenRouter
-  try {
     const raw = await callOpenRouterChat({
       messages: [
         {
@@ -128,7 +127,7 @@ async function detectIntent(message, options = {}) {
       sessionId: options.sessionId,
     });
 
-    const llmIntent = raw.toLowerCase().trim();
+    const llmIntent = typeof raw === "string" ? raw.toLowerCase().trim() : "";
     const validIntents = [
       "greeting",
       "gratitude",
