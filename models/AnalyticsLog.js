@@ -17,7 +17,7 @@ const AnalyticsLogSchema = new mongoose.Schema({
   intent: { type: String, default: "general" }, // Detailed sub-intent
   ragPath: {
     type: String,
-    enum: ["semantic", "structured", "clarify", "greeting", "none"],
+    enum: ["semantic", "structured", "clarify", "greeting", "abstained", "none"],
     default: "semantic",
   },
 
