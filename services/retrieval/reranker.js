@@ -122,13 +122,13 @@ async function bgeRerank(query, documents, options = {}) {
       const scores = Array.isArray(rawData[0]) ? rawData[0] : rawData;
 
       if (Array.isArray(scores) && scores.length > 0) {
-        // Detect broken HF serverless router output (LABEL_0 with near-zero scores < 0.01)
-        const isBrokenHfPipeline = scores.every(
-          (item) => typeof item === "object" && item.label && (item.score ?? 0) < 0.01
+        // Detect broken HF serverless router output (TextClassification pipeline returning LABEL_0)
+        const isTextClassificationOutput = scores.some(
+          (item) => typeof item === "object" && item && "label" in item
         );
-        if (isBrokenHfPipeline) {
+        if (isTextClassificationOutput) {
           console.warn(
-            "⚠️ HuggingFace router returned unranked pipeline scores (<0.01). Falling back to OpenRouter Cross-Encoder."
+            "⚠️ HuggingFace router returned TextClassification pipeline labels instead of reranker logits. Falling back to OpenRouter Cross-Encoder."
           );
           return null;
         }

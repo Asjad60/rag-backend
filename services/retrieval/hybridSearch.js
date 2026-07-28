@@ -107,10 +107,10 @@ async function executeHybridSearch(
       sparseResults = queryResult?.points ?? queryResult ?? [];
     } catch (e) {
       console.warn(
-        "⚠️ [Hybrid Search] Native BM25 sparse query failed — sparse leg skipped:",
-        e.message,
+        "⚠️ [Hybrid Search] Native BM25 sparse query failed (legacy collection) — using dense fallback:",
+        e.message
       );
-      sparseResults = [];
+      sparseResults = denseResults;
     }
   }
 

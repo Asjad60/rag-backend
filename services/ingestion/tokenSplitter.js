@@ -33,24 +33,53 @@ function countTokens(text) {
 function splitByTokens(text, maxTokens, overlapTokens = 0) {
   if (!text || !text.trim()) return [];
 
-  const enc = getTokenizer();
-  const tokens = enc.encode(text);
-
-  if (tokens.length <= maxTokens) {
+  const totalTokens = countTokens(text);
+  if (totalTokens <= maxTokens) {
     return [text];
   }
 
+  // Split into natural paragraph blocks to prevent cutting product/document cards mid-sentence
+  const paragraphs = text.split(/\n\s*\n/);
   const chunks = [];
-  let start = 0;
+  let currentChunk = "";
+  let currentTokens = 0;
 
-  while (start < tokens.length) {
-    const end = Math.min(start + maxTokens, tokens.length);
-    const chunkTokens = tokens.slice(start, end);
-    const chunkText = enc.decode(chunkTokens);
-    chunks.push(chunkText);
+  for (const para of paragraphs) {
+    const paraTokens = countTokens(para);
 
-    if (end >= tokens.length) break;
-    start += maxTokens - overlapTokens;
+    if (paraTokens > maxTokens) {
+      if (currentChunk.trim()) {
+        chunks.push(currentChunk.trim());
+        currentChunk = "";
+        currentTokens = 0;
+      }
+      const lines = para.split(/\n/);
+      for (const line of lines) {
+        const lineTokens = countTokens(line);
+        if (currentTokens + lineTokens > maxTokens && currentChunk.trim()) {
+          chunks.push(currentChunk.trim());
+          currentChunk = line + "\n";
+          currentTokens = lineTokens;
+        } else {
+          currentChunk += line + "\n";
+          currentTokens += lineTokens;
+        }
+      }
+      continue;
+    }
+
+    if (currentTokens + paraTokens > maxTokens && currentChunk.trim()) {
+      chunks.push(currentChunk.trim());
+      currentChunk = para + "\n\n";
+      currentTokens = paraTokens;
+    } else {
+      currentChunk += para + "\n\n";
+      currentTokens += paraTokens;
+    }
+  }
+
+  if (currentChunk.trim()) {
+    chunks.push(currentChunk.trim());
   }
 
   return chunks;

@@ -37,19 +37,24 @@ async function resolveAmbiguousPronouns(query, chatHistory = [], options = {}) {
     if (!msg || !msg.content) continue;
     const boldMatch = msg.content.match(/\*\*([^*]{2,60})\*\*/);
     if (boldMatch) {
-      explicitEntity = boldMatch[1].replace(/^(Title:|Product:|\s)+/i, "").trim();
-      break;
+      const candidate = boldMatch[1].replace(/^(Title:|Product:|\s)+/i, "").trim();
+      // Skip generic words like "Key Features" or "Colors Available"
+      if (!/^(Key Features|Colors Available|Sizes Available|Price|Description|Key Differences)$/i.test(candidate)) {
+        explicitEntity = candidate;
+        break;
+      }
     }
     const linkMatch = msg.content.match(/\[([^\]]{2,60})\]\(/);
     if (linkMatch) {
       explicitEntity = linkMatch[1].replace(/^(here|link|website|view|\s)+/i, "").trim();
-      if (explicitEntity.length > 2) break;
+      if (explicitEntity.length > 2 && !/^(here|link|website|view)$/i.test(explicitEntity)) break;
     }
   }
 
-  // If Tier 1 found an explicit entity and query is a simple link/price request, resolve fast!
-  if (explicitEntity && (isImplicitRequest || (isShortFollowUp && hasPronouns))) {
-    const resolved = `${explicitEntity} ${trimmed}`;
+  // If Tier 1 found an explicit entity and query has pronouns or is a short follow-up, resolve directly with entity
+  if (explicitEntity && (hasPronouns || isShortFollowUp || isImplicitRequest)) {
+    const cleanFollowUp = trimmed.replace(/\b(it|this|that|they|them|its|their|these|those|the product|the item)\b/gi, "").trim();
+    const resolved = `${explicitEntity} ${cleanFollowUp}`.trim();
     console.log(`⚡ [Query Reformulation - Fast Path] "${trimmed}" → "${resolved}" (Entity: "${explicitEntity}")`);
     return { resolvedQuery: resolved, wasResolved: true };
   }
@@ -77,7 +82,10 @@ Given the recent chat history and a user's follow-up query, rewrite the user que
       sessionId: options.sessionId,
     });
 
-    const cleanRewritten = rewritten.replace(/^["']|["']$/g, "").trim();
+    const cleanRewritten =
+      typeof rewritten === "string"
+        ? rewritten.replace(/^["']|["']$/g, "").trim()
+        : "";
     if (cleanRewritten && cleanRewritten !== trimmed) {
       console.log(`🧠 [Query Reformulation - LLM Path] "${trimmed}" → "${cleanRewritten}"`);
       return { resolvedQuery: cleanRewritten, wasResolved: true };
@@ -101,7 +109,7 @@ Given the recent chat history and a user's follow-up query, rewrite the user que
  * 3. Missing context / reliance on chat history
  * 4. Vocabulary mismatch / informal phrasing
  */
-function shouldRunHyDE(query, chatHistory = [], intent = "general") {
+function shouldRunHyDE(query, chatHistory = [], intent = "general", options = {}) {
   // 1. Environment Variable Control
   const hydeEnv = (process.env.ENABLE_HYDE || "true").toLowerCase().trim();
   if (hydeEnv === "false" || hydeEnv === "0" || hydeEnv === "off") {
@@ -109,7 +117,13 @@ function shouldRunHyDE(query, chatHistory = [], intent = "general") {
     return false;
   }
 
-  // 2. Skip for Non-Informational Intents (greeting, contact, vague clarification)
+  // 2. Rule 1: Skip HyDE after successful query rewriting / pronoun resolution
+  if (options && options.wasResolved) {
+    console.log("ℹ️ [HyDE Skipped] Rule 1: Query was successfully rewritten/resolved.");
+    return false;
+  }
+
+  // 3. Skip for Non-Informational Intents or Correction/Feedback queries
   if (["greeting", "contact", "vague"].includes(intent)) {
     console.log(
       `ℹ️ [HyDE Skipped] Intent "${intent}" does not require document expansion.`,
@@ -120,62 +134,50 @@ function shouldRunHyDE(query, chatHistory = [], intent = "general") {
   const trimmed = (query || "").trim();
   if (!trimmed) return false;
 
-  // 3. Skip if Query contains direct explicit entities (URLs, Emails, Phone Numbers)
+  // Rule 4: Skip HyDE for correction/error feedback messages
+  const isCorrectionFeedback = /\b(wrong|incorrect|invalid|error|showing the wrong|not right)\b/i.test(trimmed);
+  if (isCorrectionFeedback) {
+    console.log("ℹ️ [HyDE Skipped] Rule 4: Query is a correction/error feedback message.");
+    return false;
+  }
+
+  // 4. Rule 3: Skip if Query contains direct explicit entities (URLs, emails, phones, or product/attribute terms)
   const hasDirectEntities =
-    /https?:\/\/|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|\+?\d{10,}/.test(
-      trimmed,
-    );
+    /https?:\/\/|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|\+?\d{10,}/.test(trimmed);
   if (hasDirectEntities) {
-    console.log(
-      "ℹ️ [HyDE Skipped] Query contains direct entities (URL/email/phone).",
-    );
+    console.log("ℹ️ [HyDE Skipped] Rule 3: Query contains direct contact entities.");
+    return false;
+  }
+
+  const hasExplicitProductEntity =
+    /\b(jacket|jackets|jogger|joggers|shirt|shirts|tee|tees|pant|pants|mask|co-ords|co-ord|sleep|ice|sunscreen|office|travel|return|shipping|policy|discount|coupon)\b/i.test(trimmed);
+  if (hasExplicitProductEntity) {
+    console.log("ℹ️ [HyDE Skipped] Rule 3: Query contains an explicit product/attribute entity.");
     return false;
   }
 
   const words = trimmed.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
 
-  // Criterion 1: Very short query (1 to 4 words) -> high benefit from expansion
-  if (wordCount <= 4) {
+  // 5. Very short vague query (1 to 3 words) without explicit product terms -> benefit from expansion
+  if (wordCount <= 3) {
     console.log(
-      `💡 [HyDE Triggered] Reason 1: Very short query (${wordCount} words).`,
+      `💡 [HyDE Triggered] Reason 1: Very short vague query (${wordCount} words).`,
     );
     return true;
   }
 
-  // Criterion 2 & 3: Ambiguous query / Missing context (pronouns, feedback/corrections, implicit follow-ups)
+  // 6. Ambiguous query with pronouns or missing subject
   const hasAmbiguousPronouns =
-    /\b(it|this|that|they|them|its|their|these|those|there|you|your)\b/i.test(trimmed);
-  const hasCorrectionFeedback =
-    /\b(wrong|incorrect|invalid|error|showing the wrong|not right)\b/i.test(trimmed);
-  const isQuestionWithoutSubject =
-    /^(how|why|where|when|what|which|can i|is there|do you)\b/i.test(trimmed) &&
-    wordCount < 8;
-  const hasChatHistoryContext =
-    chatHistory && chatHistory.length > 0 && wordCount < 10;
-  if (
-    hasAmbiguousPronouns ||
-    hasCorrectionFeedback ||
-    isQuestionWithoutSubject ||
-    hasChatHistoryContext
-  ) {
+    /\b(it|this|that|they|them|its|their|these|those|there)\b/i.test(trimmed);
+
+  if (hasAmbiguousPronouns) {
     console.log(
-      "💡 [HyDE Triggered] Reason 2/3: Ambiguous query, feedback correction, or missing context.",
+      "💡 [HyDE Triggered] Reason 2: Ambiguous query with pronoun reference.",
     );
     return true;
   }
 
-  // Criterion 4: Vocabulary mismatch / Informal phrasing
-  const informalPattern =
-    /\b(cost|cheap|free|how much|help|setup|fix|issue|broken|problem|working|stuff|thing|way|option|kind|type|difference|pricing|support)\b/i;
-  if (informalPattern.test(trimmed) && wordCount < 10) {
-    console.log(
-      "💡 [HyDE Triggered] Reason 4: Potential vocabulary mismatch or informal phrasing.",
-    );
-    return true;
-  }
-
-  // If query is already detailed, direct, and explicit (e.g. > 7-8 words without ambiguity), skip HyDE
   console.log(
     `ℹ️ [HyDE Skipped] Query is sufficiently clear and detailed (${wordCount} words).`,
   );
@@ -188,7 +190,7 @@ function shouldRunHyDE(query, chatHistory = [], intent = "general") {
  *
  * @param {string} query       - User query string
  * @param {Array}  chatHistory - Recent chat history
- * @param {object} options     - { botId, sessionId, intent }
+ * @param {object} options     - { botId, sessionId, intent, wasResolved }
  * @returns {Promise<{ originalQuery: string, hydeText: string, expandedQuery: string }>}
  */
 async function generateHyDEAndExpandQuery(
@@ -200,7 +202,7 @@ async function generateHyDEAndExpandQuery(
   const intent = options.intent || "general";
 
   // Check if HyDE should run based on ENV and trigger criteria
-  if (!shouldRunHyDE(trimmed, chatHistory, intent)) {
+  if (!shouldRunHyDE(trimmed, chatHistory, intent, options)) {
     return {
       originalQuery: trimmed,
       hydeText: "",
@@ -237,9 +239,10 @@ Do NOT output greetings, preamble, or meta-comments. Output ONLY the raw hypothe
       sessionId: options.sessionId,
     });
 
-    const expandedQuery = `${trimmed}\n\n${hydeText.trim()}`;
+    const cleanHyDE = typeof hydeText === "string" ? hydeText.trim() : "";
+    const expandedQuery = cleanHyDE ? `${trimmed}\n\n${cleanHyDE}` : trimmed;
     console.log(
-      `💡 [HyDE Generated] Query: "${trimmed}" -> HyDE snippet (${hydeText.length} chars)`,
+      `💡 [HyDE Generated] Query: "${trimmed}" -> HyDE snippet (${cleanHyDE.length} chars)`
     );
 
     return {

@@ -111,6 +111,7 @@ async function detectIntent(message, options = {}) {
   if (wordCount < 3 && chatHistory.length === 0) return "vague";
 
   // LLM Fallback via OpenRouter
+  try {
     const raw = await callOpenRouterChat({
       messages: [
         {
@@ -303,19 +304,29 @@ FORMATTING & STYLE GUIDELINES:
 - Base your answer on the CONTEXT below. Synthesize details, specifications, and differences for any items or products mentioned using facts provided in the context.
 - ONLY if the CONTEXT does not contain any facts about the requested topic/product, respond with: "I don't have specific details on that. ${fallback}"
 
-PRICING & PRODUCT COMPARISON RULES:
-- When listing or comparing multiple products, kits, models, or variants, verify that EVERY price, specification, and feature is matched EXACTLY with its corresponding product name as stated in the context.
-- NEVER mix up, transpose, or swap prices between different products or variants.
-- For comparison or differentiation questions, organize the response into clear sections:
-  1. 💡 **Key Differences** (Bullet points contrasting main attributes like price, material, size, usage)
-  2. 📋 **Product Specifications & Features** (Item-by-item feature breakdown)
-  3. 🎯 **Recommendation / Summary** (Who should buy which product)
+PRICING & RECOMMENDATION RULES:
+- When recommending products or answering questions about options/recommendations:
+  1. Answer directly and concisely with the best matching product(s) found in the CONTEXT.
+  2. List key details (price, available colors/sizes, key features) using clean bullet points.
+  3. Include a direct product link if available in the context.
+  4. NEVER create dummy items or section headers with "Not specified in the context" for items not explicitly asked about. Only present real items present in the context.
+
+PRODUCT DATA ACCURACY & ANTI-DUPLICATION RULES:
+- Read each item or product's title, price, colors, and URL independently from its own block in the CONTEXT.
+- NEVER copy, transpose, or duplicate the price, regular price, discount percentage, colors, or URL of one product over to a different product.
+- If a product's price or URL is absent from its own section in the CONTEXT, state only what is explicitly written under that product's name. Do NOT copy prices or links from neighboring items.
 
 AVAILABILITY & VARIANT QUESTION RULES:
 - When a user asks about a specific size, color, or variant (or questions why a size is or isn't available):
   1. Check the exact list of available sizes, colors, and stock in the CONTEXT for that product.
   2. If the user's requested size or color is NOT listed in the context, state clearly: "According to our product details, [Product Name] is available in [list available sizes/colors from context], but [Requested Size/Color] is not listed as available."
   3. DO NOT output the fallback message "I don't have specific details on that" if the product itself IS present in the context!
+
+PRODUCT SPECIFICATIONS & ATTRIBUTES RULES:
+- When a user asks for "specs", "specifications", "material", "fabric", or "features":
+  1. Distinguish between Pricing/Colors and Material/Fabric Specifications (e.g. fabric blend, 4-way stretch, fit, UPF rating).
+  2. If material or fabric details are present in the context, format them under "### 📋 Product Specifications & Features".
+  3. If the context only contains prices and color swatches (from a listing/collection chunk), title the section "### 🏷️ Pricing & Available Options" instead of "Specifications", and include: "For full material & fabric specifications, visit the product page [here](URL)."
 
 LINKING & PRODUCT VERIFICATION RULES — follow strictly:
 - The CONTEXT below contains RESULT blocks with "Title:" and "URL:" lines.
