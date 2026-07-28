@@ -15,8 +15,33 @@ const SOFT_404_PATTERNS = [
   /under\s*maintenance/i,
 ];
 
+const EXCLUDED_URL_PATTERNS = [
+  /sitemap/i,
+  /\/cart/i,
+  /\/checkout/i,
+  /\/account/i,
+  /\/login/i,
+  /\/register/i,
+  /\/search/i,
+  /\/wishlist/i,
+  /\/order/i,
+];
+
 function checkQualityGates(normalizedData) {
-  const { rawText, metrics, pageTitle } = normalizedData;
+  const { rawText, metrics, pageTitle, url } = normalizedData;
+
+  // 0. Excluded URL pattern check (sitemaps, cart, utility pages)
+  if (url) {
+    for (const pattern of EXCLUDED_URL_PATTERNS) {
+      if (pattern.test(url)) {
+        return {
+          pass: false,
+          reason: `Excluded utility or sitemap URL pattern (${pattern.toString()})`,
+          metrics,
+        };
+      }
+    }
+  }
 
   // 1. Empty content check
   if (!rawText || !rawText.trim()) {

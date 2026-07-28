@@ -314,8 +314,8 @@ function convertHtmlToCleanMarkdown(html, baseUrl = '') {
 
   const $ = cheerio.load(html);
 
-  // 1. Remove non-content / noise elements (script, style, noscript, iframe, svg, cookie popups)
-  $('script, style, noscript, iframe, svg, [class*="cookie"], [class*="popup"], [role="alert"]').remove();
+  // 1. Remove non-content / noise elements (script, style, noscript, iframe, svg, template, header, footer, nav, cookie popups)
+  $('script, style, noscript, iframe, svg, template, header, footer, nav, [class*="cookie"], [class*="popup"], [role="alert"]').remove();
 
   const MAX_RECURSION_DEPTH = 80;
 
@@ -539,6 +539,14 @@ function normalizePage(input, pageUrl = '') {
     if (jsonLdResult.text) {
       rawText = `## Structured Data (JSON-LD)\n${jsonLdResult.text}\n\n${rawText}`;
     }
+
+    // Post-sanitize: strip residual raw serialized JSON noise blocks and base64 data URIs
+    rawText = rawText
+      .replace(/\{[\s\S]*?"variant_id"[\s\S]*?\}/gi, '')
+      .replace(/\{[\s\S]*?"product_id"[\s\S]*?\}/gi, '')
+      .replace(/data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=]+/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   } else {
     // Input is raw markdown / plain text
     rawText = safeInput.trim();

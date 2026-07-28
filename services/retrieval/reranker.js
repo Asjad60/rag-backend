@@ -3,6 +3,7 @@ const { callOpenRouterChat } = require("../llmService");
 const { logLlmUsage } = require("../llmUsageService");
 
 const RERANK_SCORE_THRESHOLD = 0.75;
+const CONFIDENCE_ABSTENTION_THRESHOLD = 0.35;
 const MAX_RERANKED_TOP_K = 3;
 
 /* ============================================================================
@@ -303,4 +304,4 @@ async function rerankCandidates(query, candidateChunks, options = {}) {
   return selectedTop5;
 }
 
-module.exports = { rerankCandidates, bgeRerank, RERANK_SCORE_THRESHOLD };
+module.exports = { rerankCandidates, bgeRerank, RERANK_SCORE_THRESHOLD, CONFIDENCE_ABSTENTION_THRESHOLD };

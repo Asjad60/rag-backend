@@ -1,10 +1,11 @@
 const { generateHyDEAndExpandQuery, resolveAmbiguousPronouns } = require("./retrieval/hydeService");
 const { executeHybridSearch } = require("./retrieval/hybridSearch");
-const { rerankCandidates } = require("./retrieval/reranker");
+const { rerankCandidates, CONFIDENCE_ABSTENTION_THRESHOLD } = require("./retrieval/reranker");
 const { generateEmbeddings } = require("./embeddingService");
 const { generateSparseVector } = require("./ingestion/vectorEngine");
 const { getCollectionName } = require("./scraperService");
 const { parseEcommerceQuery } = require("./retrieval/ecommerceQueryParser");
+const { loadCorpusStats } = require("./bm25StatsService");
 
 const INTENT_PAGE_TYPE_FILTER = {
   product: ["product_page", "pricing_page", "service_page", "homepage"],
@@ -23,14 +24,15 @@ const INTENT_PAGE_TYPE_FILTER = {
  *   2. Stage D2: Query Context Expansion & HyDE
  *   3. Stage E-G: Dual Query Representations (1536-dim Dense + BM25 Sparse)
  *   4. Stage H-K: Qdrant Multi-Tenant Search with Numeric Price Filters & Balanced Comparison Retrieval
- *   5. Stage L-N: 2nd-Stage Cohere Reranker (> 0.75 threshold) -> Top 5 Chunks
- *   6. Stage O: Resolve Matched Child Chunks to broader Parent Chunks
+ *   5. Stage L-N: 2nd-Stage Cohere/BGE Reranker (> 0.75 threshold) -> Top 5 Chunks
+ *   6. Stage N2: Confidence / Abstention Gate (< 0.35 threshold -> Abstain)
+ *   7. Stage O: Resolve Matched Child Chunks to broader Parent Chunks
  *
  * @param {string} botId       - Bot MongoDB ID
  * @param {string} query       - User query string
  * @param {Array}  chatHistory - Recent conversation history
  * @param {string} intent      - Detected user intent
- * @returns {Promise<{ searchResults: Array, resolvedParentChunks: Array, hydeText: string }>}
+ * @returns {Promise<{ searchResults: Array, resolvedParentChunks: Array, hydeText: string, isAbstained?: boolean, abstentionReason?: string }>}
  */
 async function executeRetrievalPipeline(
   botId,
@@ -46,6 +48,16 @@ async function executeRetrievalPipeline(
   const opts = { botId, sessionId: options.sessionId || "", intent };
 
   const cleanedQuery = (query || "").trim();
+
+  // Load BM25 corpus statistics for this bot (5-min TTL cache).
+  // Enables true IDF-weighted sparse vectors at query time.
+  const corpusStats = await loadCorpusStats(botId);
+  if (corpusStats) {
+    const vocabSize = Object.keys(corpusStats.termDf || {}).length;
+    console.log(`📊 [BM25] Corpus stats loaded: N=${corpusStats.totalChunks} chunks | vocab=${vocabSize} terms`);
+  } else {
+    console.warn(`⚠️ [BM25] No TermStats found for bot=${botId} — falling back to TF-only sparse vectors`);
+  }
 
   // Stage D-pre: Resolve pronouns & implicit follow-up subjects (e.g. "give me the link" -> "Sunscreen Jacket Ice Pro give me the link")
   const { resolvedQuery, wasResolved } = await resolveAmbiguousPronouns(cleanedQuery, chatHistory, opts);
@@ -67,7 +79,7 @@ async function executeRetrievalPipeline(
   const { hydeText, expandedQuery } = await generateHyDEAndExpandQuery(
     targetSearchQuery,
     chatHistory,
-    opts,
+    { ...opts, wasResolved }
   );
 
   const denseQuery = hydeText && hydeText.length > 0 ? expandedQuery : targetSearchQuery;
@@ -86,7 +98,7 @@ async function executeRetrievalPipeline(
         const subQuery = `${entity} product description price specs features`;
         const [dVec, sVec] = await Promise.all([
           generateEmbeddings(subQuery, { ...opts, operation: "dense_embedding" }),
-          Promise.resolve(generateSparseVector(entity)),
+          Promise.resolve(generateSparseVector(entity, corpusStats)),
         ]);
         return executeHybridSearch(collectionName, dVec, sVec, allowedPageTypes, extraFilter);
       })
@@ -109,7 +121,7 @@ async function executeRetrievalPipeline(
     // Standard Single-Query Hybrid Search
     const [denseVector, sparseVector] = await Promise.all([
       generateEmbeddings(denseQuery, { ...opts, operation: "dense_embedding" }),
-      Promise.resolve(generateSparseVector(sparseQuery)),
+      Promise.resolve(generateSparseVector(sparseQuery, corpusStats)),
     ]);
 
     rrfCandidates = await executeHybridSearch(
@@ -122,7 +134,15 @@ async function executeRetrievalPipeline(
   }
 
   if (!rrfCandidates || rrfCandidates.length === 0) {
-    return { searchResults: [], resolvedParentChunks: [], hydeText };
+    return {
+      searchResults: [],
+      resolvedParentChunks: [],
+      hydeText,
+      isAbstained: true,
+      topRelevanceScore: 0,
+      abstentionReason: "no_candidates_retrieved",
+      abstentionMessage: "I could not find relevant information in our store catalog.",
+    };
   }
 
   // Stage L, M, N: 2nd-Stage Cohere/BGE Reranker (> 0.75 threshold -> Top 5 Chunks)
@@ -131,6 +151,25 @@ async function executeRetrievalPipeline(
     rrfCandidates,
     opts,
   );
+
+  // Stage N2: Confidence / Abstention Gate
+  const topScore = top5SelectedChunks[0]?.relevanceScore ?? 0;
+  const isAbstained = top5SelectedChunks.length === 0 || topScore < CONFIDENCE_ABSTENTION_THRESHOLD;
+
+  if (isAbstained) {
+    console.log(
+      `🛡️ [Confidence Gate] Top relevance score (${topScore.toFixed(3)}) is below threshold (${CONFIDENCE_ABSTENTION_THRESHOLD}). Triggering abstention.`,
+    );
+    return {
+      searchResults: top5SelectedChunks,
+      resolvedParentChunks: [],
+      hydeText,
+      isAbstained: true,
+      topRelevanceScore: topScore,
+      abstentionReason: "low_confidence_score",
+      abstentionMessage: "I could not find sufficiently relevant information in our knowledge base to answer your question accurately.",
+    };
+  }
 
   // Stage O: Resolve matched Child Chunks to broader Parent Chunks
   const parentMap = new Map();
@@ -162,6 +201,8 @@ async function executeRetrievalPipeline(
     searchResults: top5SelectedChunks,
     resolvedParentChunks,
     hydeText,
+    isAbstained: false,
+    topRelevanceScore: topScore,
   };
 }
 

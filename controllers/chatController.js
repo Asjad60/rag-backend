@@ -230,14 +230,44 @@ exports.chat = async (req, res) => {
     }
 
     // ── Execute Advanced RAG Retrieval Pipeline (HyDE + RRF + Cohere Reranker + Parent Resolution)
-    const { searchResults, resolvedParentChunks } =
-      await executeRetrievalPipeline(
+    const retrievalResult = await executeRetrievalPipeline(
+      botId,
+      queryForRetrieval,
+      chatHistory,
+      intent,
+      opts
+    );
+
+    const { searchResults, resolvedParentChunks, isAbstained, abstentionMessage } = retrievalResult;
+
+    // ── Confidence / Abstention Gate Triggered ─────────────────────────────
+    if (isAbstained) {
+      let reply = abstentionMessage || `I could not find sufficient information regarding your query in ${bot.businessName || "our catalog"}. Would you like me to connect you with customer support?`;
+      if (isNonEnglish) {
+        reply = await generateChatResponse(
+          botMeta,
+          `System Instruction: Translate the following polite response to ${langName} and return ONLY the translation:\n\n${reply}`,
+          [],
+          intent,
+          langName,
+          opts
+        );
+      }
+      const logId = await logChatEvent({
         botId,
-        queryForRetrieval,
-        chatHistory,
+        sessionId,
+        detectedLang,
+        isNonEnglish,
         intent,
-        opts
-      );
+        ragPath: "abstained",
+        queryText: message,
+        translatedQuery: queryForRetrieval,
+        replyText: reply,
+        chunksRetrieved: 0,
+        guardrailFired: false,
+      });
+      return res.json({ reply, intent, detectedLang, isAbstained: true, ...(logId && { logId }) });
+    }
 
     const ragPath = branch === "product" ? "structured" : "semantic";
 
