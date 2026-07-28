@@ -122,6 +122,17 @@ async function bgeRerank(query, documents, options = {}) {
       const scores = Array.isArray(rawData[0]) ? rawData[0] : rawData;
 
       if (Array.isArray(scores) && scores.length > 0) {
+        // Detect broken HF serverless router output (LABEL_0 with near-zero scores < 0.01)
+        const isBrokenHfPipeline = scores.every(
+          (item) => typeof item === "object" && item.label && (item.score ?? 0) < 0.01
+        );
+        if (isBrokenHfPipeline) {
+          console.warn(
+            "⚠️ HuggingFace router returned unranked pipeline scores (<0.01). Falling back to OpenRouter Cross-Encoder."
+          );
+          return null;
+        }
+
         logLlmUsage({
           botId: options.botId,
           sessionId: options.sessionId,
@@ -131,7 +142,6 @@ async function bgeRerank(query, documents, options = {}) {
 
         return scores.map((item, index) => {
           const rawScore = typeof item === "number" ? item : (item.score ?? 0.5);
-          // BGE reranker models output raw logit scores. Convert to [0, 1] via Sigmoid if unbounded.
           const normalizedScore =
             rawScore > 1.0 || rawScore < 0.0
               ? 1.0 / (1.0 + Math.exp(-rawScore))
