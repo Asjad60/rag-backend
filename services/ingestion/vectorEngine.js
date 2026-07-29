@@ -40,7 +40,9 @@ async function vectorizeChunks(childChunks, url, options = {}) {
       : denseEmbeddings;
 
     const sparseVector = {
-      text: chunk.contextualText || chunk.text,
+      // Use contextualText for BM25: it contains the page title, headings, AND raw chunk text
+      // giving richer keyword signals than raw text alone. Falls back to raw text if missing.
+      text: chunk.contextualText || chunk.text || "",
       model: "Qdrant/bm25",
     };
 
@@ -69,7 +71,7 @@ async function vectorizeChunks(childChunks, url, options = {}) {
         contactPhones: chunk.contactPhones || [],
         tokenCount: chunk.tokenCount || 0,
         priceNumeric: chunk.ecommerceMeta?.priceNumeric ?? null,
-        currency: chunk.ecommerceMeta?.currency || "INR",
+        currency: chunk.ecommerceMeta?.currency || null,
         colors: chunk.ecommerceMeta?.colors || [],
         sizes: chunk.ecommerceMeta?.sizes || [],
       },

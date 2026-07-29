@@ -51,7 +51,7 @@ async function executeHybridSearch(
       limit: 30,
       filter,
       with_payload: true,
-      score_threshold: 0.15,
+      score_threshold: 0.05,
     });
   } catch (e) {
     const msg = e.message || "";

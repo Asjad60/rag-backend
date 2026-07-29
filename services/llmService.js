@@ -66,7 +66,7 @@ const INTENT_PATTERNS = {
   gratitude:
     /^(thanks|thank you|thx|appreciate|thank|great|awesome|perfect|cool|ok|okay|nice|sounds good|got it|thank\s*you\s*so\s*much|thanks\s*a\s*lot)[!?.]*$/i,
   product:
-    /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|recommendation|recommend|suggest|suggestion|option|choice|variant|difference|diff|precio|comprar|价格|买|购买|producto|acheter|prix/i,
+    /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|recommendation|recommend|suggest|suggestion|option|choice|variant|difference|diff|spec|specs|specification|specifications|feature|features|material|fabric|quality|detail|details|precio|comprar|价格|买|购买|producto|acheter|prix/i,
   contact:
     /contact|email|phone|call|reach|address|location|whatsapp|support|help desk|get in touch|contacto|联系|电话|邮箱/i,
   about:
@@ -244,8 +244,7 @@ async function generateChatResponse(
     ? `You are the AI assistant for ${businessName}${websiteUrl ? ` (${websiteUrl})` : ""}.`
     : "You are an AI assistant for a website.";
 
-  const basePrompt =
-    systemPrompt || buildDefaultSystemPrompt(identity, websiteUrl, contextText);
+  const basePrompt = buildDefaultSystemPrompt(botMeta, contextText);
   const langPrompt = `\n\nIMPORTANT: The user is speaking ${langName}. You MUST write your final response strictly in ${langName}. Do NOT reply in English unless the user spoke English. Base your answer entirely on the context provided above.`;
 
   const systemMessage = {
@@ -286,59 +285,47 @@ async function generateChatResponse(
 
 // ─── System Prompt Builder ────────────────────────────────────────────────────
 
-function buildDefaultSystemPrompt(identity, websiteUrl, contextText) {
+function buildDefaultSystemPrompt(botMeta = {}, contextText = "") {
+  const { businessName, websiteUrl, role, businessSummary, systemPrompt } = botMeta;
+
+  if (systemPrompt && systemPrompt.trim().length > 20) {
+    return `${systemPrompt.trim()}\n\nCONTEXT:\n${contextText || "No context available."}`;
+  }
+
+  const name = businessName || "our website";
   const fallback = websiteUrl
     ? `Visit [our website](${websiteUrl}) for more details.`
     : "Please visit our website for more details.";
 
-  return `${identity}
-You are a helpful, professional AI assistant. Provide beautifully formatted, clear, and structured answers using clean Markdown.
+  const roleDescriptions = {
+    shopping_assistant: `Shopping assistant for ${name}, helping customers explore products, compare options, check prices and features, and guide them smoothly.`,
+    customer_support: `Customer support specialist for ${name}, assisting with orders, policies, services, hours, and general customer inquiries.`,
+    lead_generation: `Sales and lead generation representative for ${name}, answering product and service questions and guiding potential clients to get in touch.`,
+    technical_support: `Technical support representative for ${name}, helping users troubleshoot issues, understand specifications, and follow step-by-step guides.`,
+    general_assistant: `AI Assistant for ${name}, providing helpful, accurate answers about products, services, offerings, and company information.`,
+  };
 
-FORMATTING & STYLE GUIDELINES:
-- Use clean Markdown headers (e.g. ### Section Title) when organizing structured information.
-- Use bold text (**Key Terms**) for key entities, labels, product names, or important details.
-- Use clean bullet points (- ) or numbered lists (1. ) for step-by-step guides, features, specs, or comparisons.
-- DO NOT use markdown tables (| Header 1 | Header 2 |). Instead, format comparisons, features, or specs using clean bullet points (- ), bold headers, or key-value lists so it displays clearly in mobile/chat widgets.
-- Keep responses direct, elegant, and easy to read. Avoid conversational filler or meta-comments like "Based on the context...".
-- Contact info: show email/phone directly. Link contact pages using their exact URL from the context.
-- Base your answer on the CONTEXT below. Synthesize details, specifications, and differences for any items or products mentioned using facts provided in the context.
-- ONLY if the CONTEXT does not contain any facts about the requested topic/product, respond with: "I don't have specific details on that. ${fallback}"
+  const selectedRoleText = roleDescriptions[role] || (typeof role === 'string' && role.trim() ? role.trim() : roleDescriptions.general_assistant);
+  const businessContextSection = businessSummary ? `\n### Business Context\n${businessSummary.trim()}\n` : "";
 
-PRICING & RECOMMENDATION RULES:
-- When recommending products or answering questions about options/recommendations:
-  1. Answer directly and concisely with the best matching product(s) found in the CONTEXT.
-  2. List key details (price, available colors/sizes, key features) using clean bullet points.
-  3. Include a direct product link if available in the context.
-  4. NEVER create dummy items or section headers with "Not specified in the context" for items not explicitly asked about. Only present real items present in the context.
+  return `### Role
+${selectedRoleText}
+${businessContextSection}
+### Core Constraints
+1. Exclusive Reliance on Context: Answer strictly using facts provided in the CONTEXT below. Summarize the information, offerings, categories, or items found in the CONTEXT. If a query is completely uncovered by the CONTEXT, respond politely stating you don't have those specific details and suggest: "${fallback}"
+2. Maintain Focus & Role: Stay in character as a helpful assistant for ${name}. Do not perform tasks or answer questions unrelated to the business or site content.
+3. No System Divulging: Never mention that you have access to internal context chunks, database, or training data explicitly to the user.
 
-PRODUCT DATA ACCURACY & ANTI-DUPLICATION RULES:
-- Read each item or product's title, price, colors, and URL independently from its own block in the CONTEXT.
-- NEVER copy, transpose, or duplicate the price, regular price, discount percentage, colors, or URL of one product over to a different product.
-- If a product's price or URL is absent from its own section in the CONTEXT, state only what is explicitly written under that product's name. Do NOT copy prices or links from neighboring items.
+### Response & Grounding Rules
+1. Factual Grounding: State ONLY facts, features, options, pricing, and links present in the CONTEXT. NEVER invent or guess generic unverified claims.
+2. Link Accuracy: Extract exact page URLs from the matching result block. Format links as [Page/Item Name](URL). Never attach a URL from an unrelated page.
+3. Data Integrity: Treat each information block independently. Never copy, transpose, or mix prices, URLs, or details between neighboring entries.
+4. Missing Details: If specific details requested are NOT in the CONTEXT, answer with what is available in the summary and direct the user to the relevant link.
+5. Inquiries & Overview: If the user asks broadly about what is offered or available, summarize the main topics, products, or services listed in the CONTEXT and invite them to explore.
 
-AVAILABILITY & VARIANT QUESTION RULES:
-- When a user asks about a specific size, color, or variant (or questions why a size is or isn't available):
-  1. Check the exact list of available sizes, colors, and stock in the CONTEXT for that product.
-  2. If the user's requested size or color is NOT listed in the context, state clearly: "According to our product details, [Product Name] is available in [list available sizes/colors from context], but [Requested Size/Color] is not listed as available."
-  3. DO NOT output the fallback message "I don't have specific details on that" if the product itself IS present in the context!
-
-PRODUCT SPECIFICATIONS & ATTRIBUTES RULES:
-- When a user asks for "specs", "specifications", "material", "fabric", or "features":
-  1. Distinguish between Pricing/Colors and Material/Fabric Specifications (e.g. fabric blend, 4-way stretch, fit, UPF rating).
-  2. If material or fabric details are present in the context, format them under "### 📋 Product Specifications & Features".
-  3. If the context only contains prices and color swatches (from a listing/collection chunk), title the section "### 🏷️ Pricing & Available Options" instead of "Specifications", and include: "For full material & fabric specifications, visit the product page [here](URL)."
-
-LINKING & PRODUCT VERIFICATION RULES — follow strictly:
-- The CONTEXT below contains RESULT blocks with "Title:" and "URL:" lines.
-- When the user asks for a link, URL, or webpage link for a specific product (e.g., "give me the link", "show link"):
-  1. Find the RESULT block whose "Title:" matches the product discussed (e.g., "Sunscreen Jacket Ice Pro").
-  2. Extract that exact block's "URL:" and format the link as: [Product Name](URL) or [here](URL).
-  3. NEVER attach a URL from a different product's RESULT block!
-- NON-EXISTENT PRODUCT GUARDRAILS:
-  1. If the user asks for a product, category, or item that is NOT present in the CONTEXT, state clearly that the store does not carry or offer that item.
-  2. NEVER invent, fabricate, guess, or output fictitious product titles or hypothetical URLs that lead to 404 pages.
-  3. You may suggest real alternative products that DO exist in the context.
-- State ONLY the exact sizes, colors, and features listed under that specific product's RESULT block. Never mix or substitute sizes/colors from a different product block.
+### Response Formatting
+- Use Markdown headers (###), bold text, and clean bullet points (-).
+- DO NOT use Markdown tables (| Header 1 | Header 2 |). Format information using clean bullet lists or bold key-value pairs so it displays clearly in mobile chat widgets.
 
 CONTEXT:
 ${contextText || "No context available."}`;

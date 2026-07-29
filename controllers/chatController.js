@@ -83,6 +83,8 @@ exports.chat = async (req, res) => {
       websiteUrl: bot.websiteUrl,
       welcomeMessage: bot.welcomeMessage,
       systemPrompt: bot.systemPrompt || "",
+      role: bot.role || "general_assistant",
+      businessSummary: bot.businessSummary || "",
     };
 
     const opts = { botId, sessionId };

@@ -19,11 +19,12 @@ async function resolveAmbiguousPronouns(query, chatHistory = [], options = {}) {
 
   // 1. Fast Guard: Check if query requires contextual resolution
   const hasPronouns = /\b(it|this|that|they|them|its|their|these|those|the product|the item)\b/i.test(trimmed);
-  const isShortFollowUp = trimmed.split(/\s+/).length <= 5;
   const isImplicitRequest = /^(give me the link|give link|link|show link|url|website link|where to buy|how to buy|what is the price|price|cost|is it in stock|buy link)\b/i.test(trimmed);
   const isObjection = /\b(wrong|incorrect|not have|does not have|doesn't have|how can you say)\b/i.test(trimmed);
+  const isStandaloneQuestion = /^(what|where|who|why|how do|how can|do you|can you|is there|are there|tell me)\b/i.test(trimmed) && !hasPronouns;
+  const isShortFragment = trimmed.split(/\s+/).length <= 4 && !isStandaloneQuestion;
 
-  const needsResolution = hasPronouns || isShortFollowUp || isImplicitRequest || isObjection;
+  const needsResolution = (hasPronouns || isImplicitRequest || isObjection || isShortFragment) && !isStandaloneQuestion;
   if (!needsResolution) {
     return { resolvedQuery: trimmed, wasResolved: false };
   }
@@ -38,8 +39,8 @@ async function resolveAmbiguousPronouns(query, chatHistory = [], options = {}) {
     const boldMatch = msg.content.match(/\*\*([^*]{2,60})\*\*/);
     if (boldMatch) {
       const candidate = boldMatch[1].replace(/^(Title:|Product:|\s)+/i, "").trim();
-      // Skip generic words like "Key Features" or "Colors Available"
-      if (!/^(Key Features|Colors Available|Sizes Available|Price|Description|Key Differences)$/i.test(candidate)) {
+      // Skip generic words and common UI/page headers like "Key Features", "About page", etc.
+      if (!/^(Key Features|Colors Available|Sizes Available|Price|Description|Key Differences|About page|About Us|Contact Us|Home|Header|Footer|Note|Warning)$/i.test(candidate)) {
         explicitEntity = candidate;
         break;
       }
@@ -47,14 +48,17 @@ async function resolveAmbiguousPronouns(query, chatHistory = [], options = {}) {
     const linkMatch = msg.content.match(/\[([^\]]{2,60})\]\(/);
     if (linkMatch) {
       explicitEntity = linkMatch[1].replace(/^(here|link|website|view|\s)+/i, "").trim();
-      if (explicitEntity.length > 2 && !/^(here|link|website|view)$/i.test(explicitEntity)) break;
+      if (explicitEntity.length > 2 && !/^(here|link|website|view|about|contact|home)$/i.test(explicitEntity)) break;
     }
   }
 
-  // If Tier 1 found an explicit entity and query has pronouns or is a short follow-up, resolve directly with entity
-  if (explicitEntity && (hasPronouns || isShortFollowUp || isImplicitRequest)) {
+  // If Tier 1 found an explicit entity and query has pronouns or is an implicit fragment, resolve directly with entity
+  if (explicitEntity && (hasPronouns || isImplicitRequest || isShortFragment)) {
     const cleanFollowUp = trimmed.replace(/\b(it|this|that|they|them|its|their|these|those|the product|the item)\b/gi, "").trim();
-    const resolved = `${explicitEntity} ${cleanFollowUp}`.trim();
+    let resolved = `${explicitEntity} ${cleanFollowUp}`.trim();
+    if (/\b(feature|features|spec|specs|specification|specifications|material|fabric)\b/i.test(trimmed)) {
+      resolved = `${explicitEntity} specifications features material fabric details ${cleanFollowUp}`.trim();
+    }
     console.log(`⚡ [Query Reformulation - Fast Path] "${trimmed}" → "${resolved}" (Entity: "${explicitEntity}")`);
     return { resolvedQuery: resolved, wasResolved: true };
   }
@@ -141,18 +145,11 @@ function shouldRunHyDE(query, chatHistory = [], intent = "general", options = {}
     return false;
   }
 
-  // 4. Rule 3: Skip if Query contains direct explicit entities (URLs, emails, phones, or product/attribute terms)
+  // 4. Rule 3: Skip if Query contains direct explicit entities (URLs, emails, phones)
   const hasDirectEntities =
     /https?:\/\/|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|\+?\d{10,}/.test(trimmed);
   if (hasDirectEntities) {
     console.log("ℹ️ [HyDE Skipped] Rule 3: Query contains direct contact entities.");
-    return false;
-  }
-
-  const hasExplicitProductEntity =
-    /\b(jacket|jackets|jogger|joggers|shirt|shirts|tee|tees|pant|pants|mask|co-ords|co-ord|sleep|ice|sunscreen|office|travel|return|shipping|policy|discount|coupon)\b/i.test(trimmed);
-  if (hasExplicitProductEntity) {
-    console.log("ℹ️ [HyDE Skipped] Rule 3: Query contains an explicit product/attribute entity.");
     return false;
   }
 
@@ -174,6 +171,15 @@ function shouldRunHyDE(query, chatHistory = [], intent = "general", options = {}
   if (hasAmbiguousPronouns) {
     console.log(
       "💡 [HyDE Triggered] Reason 2: Ambiguous query with pronoun reference.",
+    );
+    return true;
+  }
+
+  // 7. Broad catalog/collection discovery queries (e.g. "what catalogs do you provide?", "what collections do you have?")
+  const isCatalogDiscovery = /\b(catalog|catalogs|collection|collections|category|categories|what do you sell|what do you offer|what do you provide|all products)\b/i.test(trimmed);
+  if (isCatalogDiscovery) {
+    console.log(
+      "💡 [HyDE Triggered] Reason 3: Broad catalog/collection discovery query requiring expansion.",
     );
     return true;
   }
@@ -201,12 +207,18 @@ async function generateHyDEAndExpandQuery(
   const trimmed = query.trim();
   const intent = options.intent || "general";
 
+  // Synonym expansion for e-commerce catalog / collection queries
+  let baseExpandedQuery = trimmed;
+  if (/\b(catalog|catalogs)\b/i.test(trimmed)) {
+    baseExpandedQuery = `${trimmed} collections categories products apparel items`;
+  }
+
   // Check if HyDE should run based on ENV and trigger criteria
   if (!shouldRunHyDE(trimmed, chatHistory, intent, options)) {
     return {
       originalQuery: trimmed,
       hydeText: "",
-      expandedQuery: trimmed,
+      expandedQuery: baseExpandedQuery,
     };
   }
 

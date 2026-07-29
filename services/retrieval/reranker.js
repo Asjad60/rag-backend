@@ -2,9 +2,9 @@ const axios = require("axios");
 const { callOpenRouterChat } = require("../llmService");
 const { logLlmUsage } = require("../llmUsageService");
 
-const RERANK_SCORE_THRESHOLD = 0.75;
-const CONFIDENCE_ABSTENTION_THRESHOLD = 0.35;
-const MAX_RERANKED_TOP_K = 3;
+const RERANK_SCORE_THRESHOLD = 0.60;
+const CONFIDENCE_ABSTENTION_THRESHOLD = 0.25;
+const MAX_RERANKED_TOP_K = 5;
 
 /* ============================================================================
  * COHERE RERANKER (COMMENTED OUT FOR REFERENCE AS REQUESTED)
@@ -170,9 +170,10 @@ async function bgeRerank(query, documents, options = {}) {
 async function crossEncoderLLMScoring(query, candidateChunks, options = {}) {
   if (!candidateChunks || candidateChunks.length === 0) return [];
 
+  const queryForScoring = (query || "").split("\n\n")[0].trim();
+
   const chunksText = candidateChunks
     .map(
-      // (c, i) => `[CHUNK ${i + 1}]:\n${(c.payload?.text || "").slice(0, 400)}`,
       (c, i) =>
         `[CHUNK ${i + 1} | Title: ${c.payload?.pageTitle || "Page"} | URL: ${c.payload?.url || ""}]:\n${(c.payload?.contextualText || c.payload?.text || "").slice(0, 1000)}`,
     )
@@ -195,7 +196,7 @@ Reply ONLY with a JSON array of objects in this exact format:
         { role: "system", content: systemInstruction },
         {
           role: "user",
-          content: `Query: ${query}\n\nCandidate Chunks:\n${chunksText}`,
+          content: `Query: ${queryForScoring}\n\nCandidate Chunks:\n${chunksText}`,
         },
       ],
       temperature: 0.0,
@@ -204,17 +205,31 @@ Reply ONLY with a JSON array of objects in this exact format:
       botId: options.botId,
       sessionId: options.sessionId,
     });
+    console.log("🎯 [Cross-Encoder Raw Output]:", raw);
 
-    const jsonStr = raw.replace(/```json|```/g, "").trim();
+    const matchJson = raw.match(/\[[\s\S]*\]/);
+    const jsonStr = matchJson ? matchJson[0] : raw.replace(/```json|```/g, "").trim();
     const scores = JSON.parse(jsonStr);
 
     return candidateChunks.map((chunk, i) => {
-      const match = scores.find((s) => s.index === i);
+      let scoreVal = 0.8;
+      if (Array.isArray(scores)) {
+        const match = scores.find(
+          (s) =>
+            typeof s === "object" &&
+            s !== null &&
+            (s.index === i || s.index === i + 1 || s.chunk === i || s.chunk === i + 1 || s.item === i || s.item === i + 1)
+        ) || scores[i];
+
+        if (typeof match === "number") {
+          scoreVal = match;
+        } else if (match && typeof match.score === "number") {
+          scoreVal = match.score;
+        }
+      }
       return {
         ...chunk,
-        relevanceScore: match
-          ? parseFloat(match.score.toFixed(4))
-          : chunk.score || 0.5,
+        relevanceScore: parseFloat(Number(scoreVal).toFixed(4)),
       };
     });
   } catch (error) {
@@ -224,7 +239,7 @@ Reply ONLY with a JSON array of objects in this exact format:
     );
     return candidateChunks.map((c) => ({
       ...c,
-      relevanceScore: c.score || 0.8,
+      relevanceScore: c.rrfScore ?? 0.8,
     }));
   }
 }
@@ -287,6 +302,18 @@ async function rerankCandidates(query, candidateChunks, options = {}) {
       topCandidates,
       options,
     );
+  }
+
+  // Fallback: If top score is 0 or all scores are 0, fall back to RRF vector rankings
+  const maxScore = Math.max(...scoredCandidates.map((c) => c.relevanceScore || 0), 0);
+  if (maxScore === 0) {
+    console.log(
+      "⚠️ [Reranker Fallback] Cross-Encoder scored all chunks 0.00. Preserving top RRF vector candidates for LLM context synthesis.",
+    );
+    scoredCandidates = topCandidates.map((c, idx) => ({
+      ...c,
+      relevanceScore: parseFloat(Math.max(0.85 - idx * 0.02, 0.75).toFixed(4)),
+    }));
   }
 
   // Filter candidates matching threshold > 0.75

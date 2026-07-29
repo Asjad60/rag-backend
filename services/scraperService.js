@@ -17,17 +17,65 @@ function getCollectionName(botId) {
 
 // ─── Link Discovery Utilities ────────────────────────────────────────────────
 
-function collectInternalLinks($, baseUrl, limit = 30) {
-  const base = new URL(baseUrl);
+const NON_HTML_EXTENSIONS = /\.(pdf|png|jpe?g|webp|gif|svg|ico|bmp|tiff|avif|mp4|webm|avi|mov|mkv|mp3|wav|ogg|flac|m4a|zip|tar|gz|rar|7z|exe|dmg|apk|iso|bin|css|js|mjs|json|xml|rss|atom|woff2?|ttf|eot|otf)$/i;
+
+const IGNORED_PATH_PATTERNS = [
+  /\/cdn-cgi\//i,
+  /\/wp-content\/uploads\//i,
+  /\/assets\/(?:images|img|css|js|fonts)\//i,
+];
+
+function isCrawlableWebpageUrl(urlString) {
+  if (!urlString || typeof urlString !== "string") return false;
+  if (!/^https?:\/\//i.test(urlString)) return false;
+
+  try {
+    const parsed = new URL(urlString);
+    const pathname = parsed.pathname.toLowerCase();
+
+    // Reject non-HTML extensions (images, pdfs, media, docs, archives, etc.)
+    if (NON_HTML_EXTENSIONS.test(pathname)) {
+      return false;
+    }
+
+    // Reject cdn-cgi email-protection and static asset folders
+    for (const pattern of IGNORED_PATH_PATTERNS) {
+      if (pattern.test(pathname)) {
+        return false;
+      }
+    }
+
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function isSameDomain(url1, url2) {
+  try {
+    const host1 = new URL(url1).hostname.replace(/^www\./i, "").toLowerCase();
+    const host2 = new URL(url2).hostname.replace(/^www\./i, "").toLowerCase();
+    return host1 === host2;
+  } catch (_) {
+    return false;
+  }
+}
+
+function collectInternalLinks($, baseUrl, limit = 50) {
   const links = new Set();
   $("a[href]").each((_, el) => {
     try {
       const href = $(el).attr("href");
+      if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:") || href.startsWith("tel:")) {
+        return;
+      }
       const resolved = new URL(href, baseUrl);
-      if (resolved.hostname === base.hostname) {
-        resolved.hash = "";
-        resolved.search = "";
-        links.add(resolved.toString());
+      resolved.hash = "";
+      resolved.search = "";
+      const resolvedUrl = resolved.toString();
+
+      if (isSameDomain(resolvedUrl, baseUrl) && isCrawlableWebpageUrl(resolvedUrl)) {
+        links.add(resolvedUrl);
       }
     } catch (_) {}
   });
@@ -37,41 +85,66 @@ function collectInternalLinks($, baseUrl, limit = 30) {
 // ─── Sitemap Discovery ────────────────────────────────────────────────────────
 
 async function fetchSitemapXml(sitemapUrl, origin, depth = 0) {
-  if (depth > 1) return [];
+  if (depth > 2) return [];
   try {
     const res = await axios.get(sitemapUrl, {
-      timeout: 10_000,
+      timeout: 12_000,
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)",
-        Accept: "application/xml, text/xml, */*",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        Accept: "application/xml, text/xml, application/xhtml+xml, */*",
       },
     });
 
-    const $ = cheerio.load(res.data, { xmlMode: true });
-    const urls = [];
+    const xmlContent = typeof res.data === "string" ? res.data : String(res.data || "");
+    const urls = new Set();
+    const childSitemaps = new Set();
 
-    const childLocs = $("sitemapindex sitemap loc").toArray();
-    if (childLocs.length > 0) {
-      for (const el of childLocs.slice(0, 10)) {
-        const childUrl = $(el).text().trim();
-        const childUrls = await fetchSitemapXml(childUrl, origin, depth + 1);
-        urls.push(...childUrls);
-        if (urls.length >= MAX_CRAWL_PAGES * 2) break;
+    // 1. Cheerio Parse
+    try {
+      const $ = cheerio.load(xmlContent, { xmlMode: true });
+
+      $("sitemapindex sitemap loc, sitemap loc").each((_, el) => {
+        const loc = $(el).text().trim();
+        if (loc) childSitemaps.add(loc);
+      });
+
+      $("urlset url loc, url loc").each((_, el) => {
+        const loc = $(el).text().trim();
+        if (loc && isSameDomain(loc, origin) && isCrawlableWebpageUrl(loc)) {
+          urls.add(loc);
+        }
+      });
+    } catch (_) {}
+
+    // 2. Regex Fallback for loc tags
+    const locMatches = xmlContent.matchAll(/<loc>(?:<!\[CDATA\[)?(https?:\/\/[^\s\]<]+)(?:\]\]>)?<\/loc>/gi);
+    for (const match of locMatches) {
+      const loc = match[1].trim();
+      if (!loc) continue;
+
+      if (loc.endsWith(".xml") || loc.includes("sitemap")) {
+        if (!loc.startsWith(sitemapUrl)) childSitemaps.add(loc);
+      } else if (isSameDomain(loc, origin) && isCrawlableWebpageUrl(loc)) {
+        urls.add(loc);
       }
-      return urls;
     }
 
-    $("urlset url loc").each((_, el) => {
-      const loc = $(el).text().trim();
-      try {
-        if (new URL(loc).hostname === new URL(origin).hostname) {
-          urls.push(loc);
-        }
-      } catch (_) {}
-    });
+    // Process nested child sitemaps
+    if (childSitemaps.size > 0 && depth < 2) {
+      const childArray = [...childSitemaps].slice(0, 15);
+      for (const childUrl of childArray) {
+        const childExtracted = await fetchSitemapXml(childUrl, origin, depth + 1);
+        childExtracted.forEach((u) => {
+          if (isCrawlableWebpageUrl(u)) urls.add(u);
+        });
+        if (urls.size >= MAX_CRAWL_PAGES * 2) break;
+      }
+    }
 
-    return urls;
-  } catch (_) {
+    return [...urls];
+  } catch (err) {
+    console.warn(`⚠️ Could not fetch sitemap ${sitemapUrl}: ${err.message}`);
     return [];
   }
 }
@@ -83,12 +156,13 @@ async function discoverSitemapUrls(rootUrl) {
   for (const path of [
     "/sitemap.xml",
     "/sitemap_index.xml",
+    "/sitemap-index.xml",
     "/xmlsitemap.php",
   ]) {
     const urls = await fetchSitemapXml(`${origin}${path}`, origin);
     if (urls.length > 0) {
       console.log(
-        `🗺️  Sitemap found: ${origin}${path} (${urls.length} raw URLs)`,
+        `🗺️  Sitemap found: ${origin}${path} (${urls.length} URLs extracted)`,
       );
       return urls;
     }
@@ -97,7 +171,10 @@ async function discoverSitemapUrls(rootUrl) {
   try {
     const robotsRes = await axios.get(`${origin}/robots.txt`, {
       timeout: 8_000,
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)" },
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      },
     });
     const sitemapLines = robotsRes.data
       .split("\n")
@@ -108,7 +185,7 @@ async function discoverSitemapUrls(rootUrl) {
       const urls = await fetchSitemapXml(sitemapUrl, origin);
       if (urls.length > 0) {
         console.log(
-          `🗺️  Sitemap via robots.txt: ${sitemapUrl} (${urls.length} raw URLs)`,
+          `🗺️  Sitemap via robots.txt: ${sitemapUrl} (${urls.length} URLs extracted)`,
         );
         return urls;
       }
@@ -261,7 +338,7 @@ async function scrapeAndStore(botId, rootUrl) {
     }
   }
 
-  urlQueue = [...new Set(urlQueue)].slice(0, MAX_CRAWL_PAGES);
+  urlQueue = [...new Set(urlQueue)].filter(isCrawlableWebpageUrl).slice(0, MAX_CRAWL_PAGES);
   console.log(
     `📋 Queued ${urlQueue.length} URLs | Native BM25 Ingestion Pipeline`,
   );

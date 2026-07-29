@@ -59,7 +59,7 @@ function detectPageType(urlString = '', $ = null, jsonLdTypes = []) {
   // 2. URL Path Pattern Signals
   if (/contact|reach-us|get-in-touch|support|contact-us|location|locations|branches/.test(path)) return 'contact_page';
   if (/about|company|team|who-we-are|our-story|mission|vision|history|leadership/.test(path)) return 'about_page';
-  if (/product|products|shop|store|catalog|item|sku|cart|buy|\/p\/|\/dp\/|\/pd\/|collection|collections/.test(path)) return 'product_page';
+  if (/\/products?\/|\/shop\/|\/store\/|\/catalog\/|\/items?\/|[?&]sku=|[?&]product|\bsku\b|\/cart\/|\/buy\/|\/p\/|\/dp\/|\/pd\/|\/collections?\/|\/specs?\/|\/specifications?\//.test(path)) return 'product_page';
   if (/service|services|solution|solutions|offering|offerings/.test(path)) return 'service_page';
   if (/faq|faqs|help|knowledge|knowledgebase|support-faq/.test(path)) return 'faq_page';
   if (/blog|blogs|article|articles|news|post|posts/.test(path)) return 'blog_page';
@@ -216,6 +216,24 @@ function extractJsonLd($) {
           const r = node.aggregateRating;
           if (r.ratingValue) lines.push(`Rating: ${r.ratingValue}${r.bestRating ? `/${r.bestRating}` : ''} (${r.reviewCount || r.ratingCount || '?'} reviews)`);
         }
+
+        if (typeof node.material === 'string') lines.push(`Material: ${node.material}`);
+        else if (node.material?.name) lines.push(`Material: ${node.material.name}`);
+
+        if (typeof node.pattern === 'string') lines.push(`Pattern: ${node.pattern}`);
+
+        if (node.additionalProperty) {
+          const props = Array.isArray(node.additionalProperty) ? node.additionalProperty : [node.additionalProperty];
+          props.forEach(p => {
+            if (p && typeof p === 'object' && p.name && p.value != null) {
+              const nameStr = String(p.name).trim();
+              const valStr = String(p.value).trim();
+              if (nameStr && valStr && nameStr.length < 50 && valStr.length < 150) {
+                lines.push(`${nameStr}: ${valStr}`);
+              }
+            }
+          });
+        }
       }
 
       // ── Service ─────────────────────────────────────────────────────────────
@@ -314,8 +332,11 @@ function convertHtmlToCleanMarkdown(html, baseUrl = '') {
 
   const $ = cheerio.load(html);
 
-  // 1. Remove non-content / noise elements (script, style, noscript, iframe, svg, template, header, footer, nav, cookie popups)
-  $('script, style, noscript, iframe, svg, template, header, footer, nav, [class*="cookie"], [class*="popup"], [role="alert"]').remove();
+  // 1. Remove non-content / noise elements. Keep <header> body element — it often holds hero/tagline content.
+  //    Only remove nav menus inside headers, not the header itself.
+  $('script, style, noscript, iframe, svg, template, footer, [class*="cookie"], [class*="popup"], [role="alert"]').remove();
+  // Remove site-wide navigation bars but preserve header semantic sections
+  $('nav, header nav, header > ul, header > [role="navigation"]').remove();
 
   const MAX_RECURSION_DEPTH = 80;
 
@@ -354,14 +375,8 @@ function convertHtmlToCleanMarkdown(html, baseUrl = '') {
       return rows.length ? `\n\n${rows.join('\n')}\n\n` : '';
     }
 
-    // Leaf / inline element price check
+    // Leaf / inline element indicator
     const isLeafOrInline = !['div', 'section', 'article', 'main', 'table', 'tbody', 'thead', 'form'].includes(tagName);
-
-    // Strikethrough / Compare At Prices (<del>, <s>, <strike>, compare/was/old/original)
-    const isStrikethrough = ['del', 's', 'strike'].includes(tagName) || (isLeafOrInline && /\b(compare-price|was-price|old-price|original-price|strikethrough|strike)\b/i.test(`${className} ${idName}`));
-    
-    // Sale / Current Price Tags on leaf elements
-    const isCurrentPrice = isLeafOrInline && /\b(current-price|sale-price|now-price|offer-price|price-new|final-price|special-price|regular-price|price--regular)\b/i.test(`${className} ${idName}`);
 
     // Check inline attributes for price content (<meta itemprop="price" content="...">)
     const metaPrice = $(node).attr('itemprop') === 'price' || $(node).attr('data-price')
@@ -375,18 +390,51 @@ function convertHtmlToCleanMarkdown(html, baseUrl = '') {
       return ` Price: ${metaPrice} `;
     }
 
-    if (isStrikethrough) {
+    // Standard Strikethrough (<del>, <s>, <strike>) -> Markdown ~~text~~
+    if (['del', 's', 'strike'].includes(tagName)) {
+      const sText = childTexts.replace(/\s+/g, ' ').trim();
+      return sText ? ` ~~${sText}~~ ` : '';
+    }
+
+    // Compare At / Original Price CSS classes (e.g. .was-price, .compare-price)
+    const isComparePriceClass = isLeafOrInline && /\b(compare-price|was-price|old-price|original-price)\b/i.test(`${className} ${idName}`);
+    if (isComparePriceClass) {
       const strikethroughText = childTexts.replace(/\s+/g, ' ').trim();
       if (strikethroughText && strikethroughText.length < 50) {
-        return ` (Original Price: ${strikethroughText}) `;
+        return ` ~~${strikethroughText}~~ `;
       }
     }
 
-    if (isCurrentPrice) {
+    // Current Price CSS classes (e.g. .current-price, .sale-price)
+    const isCurrentPriceClass = isLeafOrInline && /\b(current-price|sale-price|now-price|offer-price|price-new|final-price|special-price)\b/i.test(`${className} ${idName}`);
+    if (isCurrentPriceClass) {
       const priceText = childTexts.replace(/\s+/g, ' ').trim();
-      if (priceText && priceText.length < 50) {
+      if (priceText && priceText.length < 50 && /(?:USD|EUR|GBP|INR|\$|₹|£|€|\d)/i.test(priceText)) {
         return ` Price: ${priceText} `;
       }
+    }
+
+    // Bold / Strong
+    if (tagName === 'strong' || tagName === 'b') {
+      const boldText = childTexts.replace(/\s+/g, ' ').trim();
+      return boldText ? `**${boldText}**` : '';
+    }
+
+    // Italic / Emphasis
+    if (tagName === 'em' || tagName === 'i') {
+      const italicText = childTexts.replace(/\s+/g, ' ').trim();
+      return italicText ? `_${italicText}_` : '';
+    }
+
+    // Preformatted / Code blocks
+    if (tagName === 'pre') {
+      const codeText = childTexts.trim();
+      return codeText ? `\n\`\`\`\n${codeText}\n\`\`\`\n` : '';
+    }
+    if (tagName === 'code') {
+      // Inline code (inside a pre is handled by pre above, this catches standalone <code>)
+      const codeText = childTexts.replace(/\s+/g, ' ').trim();
+      return codeText ? `\`${codeText}\`` : '';
     }
 
     // Headings (h1 - h6)
@@ -429,6 +477,12 @@ function convertHtmlToCleanMarkdown(html, baseUrl = '') {
       return '';
     }
 
+    // Summary Tag (<summary>) - Accordions & Expandable Specs
+    if (tagName === 'summary') {
+      const summaryText = childTexts.replace(/\s+/g, ' ').trim();
+      return summaryText ? `\n\n### ${summaryText}\n` : '';
+    }
+
     // Definition Lists (dt, dd)
     if (tagName === 'dt') {
       const dtText = childTexts.replace(/\s+/g, ' ').trim();
@@ -445,8 +499,16 @@ function convertHtmlToCleanMarkdown(html, baseUrl = '') {
       return liText ? `\n- ${liText}` : '';
     }
 
+    // Blockquote — preserve with > prefix for testimonials, citations, documentation
+    if (tagName === 'blockquote') {
+      const bqText = childTexts.trim();
+      if (!bqText) return '';
+      const prefixed = bqText.split('\n').map(l => `> ${l}`).join('\n');
+      return `\n${prefixed}\n`;
+    }
+
     // Block Elements
-    if (['p', 'div', 'section', 'article', 'blockquote', 'main', 'figure', 'ul', 'ol', 'form'].includes(tagName)) {
+    if (['p', 'div', 'section', 'article', 'main', 'figure', 'ul', 'ol', 'form', 'details', 'header', 'aside'].includes(tagName)) {
       const blockText = childTexts.trim();
       return blockText ? `\n${blockText}\n` : '';
     }
@@ -609,7 +671,7 @@ function normalizePage(input, pageUrl = '') {
  */
 function extractEcommerceMetadata(rawText = '') {
   let priceNumeric = null;
-  let currency = 'INR';
+  let currency = null;
 
   // Search for prices: e.g. "Price: USD 499", "Price: ₹500", "$49.99", "500 rupees"
   const priceMatch = rawText.match(/(?:price|cost|msrp|pricing|rate|special price|now|was):\s*(?:(USD|EUR|GBP|INR|\$|₹|£|€)\s*)?([\d,]+(?:\.\d{1,2})?)/i) ||

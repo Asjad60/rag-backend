@@ -12,10 +12,10 @@ const { getCollectionName } = require("./scraperService");
 const { parseEcommerceQuery } = require("./retrieval/ecommerceQueryParser");
 
 const INTENT_PAGE_TYPE_FILTER = {
-  product: ["product_page", "pricing_page", "service_page", "homepage"],
-  contact: ["contact_page"],
-  about: ["about_page", "homepage"],
-  faq: ["faq_page"],
+  product: ["product_page", "collection_page", "category_page", "pricing_page", "service_page", "homepage", "general_page", "faq_page", "blog_page"],
+  contact: ["contact_page", "homepage"],
+  about: ["about_page", "homepage", "collection_page", "category_page", "general_page"],
+  faq: ["faq_page", "general_page"],
   navigation: [],
   general: [],
 };
@@ -53,7 +53,7 @@ async function executeRetrievalPipeline(
 
   const cleanedQuery = (query || "").trim();
 
-  // Stage D-pre: Resolve pronouns & implicit follow-up subjects (e.g. "give me the link" -> "Sunscreen Jacket Ice Pro give me the link")
+  // Stage D-pre: Resolve pronouns & implicit follow-up subjects (e.g. "give me the link" -> "Product Name give me the link")
   const { resolvedQuery, wasResolved } = await resolveAmbiguousPronouns(
     cleanedQuery,
     chatHistory,
@@ -87,7 +87,7 @@ async function executeRetrievalPipeline(
 
   const denseQuery =
     hydeText && hydeText.length > 0 ? expandedQuery : targetSearchQuery;
-  const sparseQuery = targetSearchQuery;
+  const sparseQuery = expandedQuery;
 
   const allowedPageTypes = INTENT_PAGE_TYPE_FILTER[intent] ?? [];
   let rrfCandidates = [];
@@ -160,26 +160,28 @@ async function executeRetrievalPipeline(
       topRelevanceScore: 0,
       abstentionReason: "no_candidates_retrieved",
       abstentionMessage:
-        "I could not find relevant information in our store catalog.",
+        "I could not find relevant information in our knowledge base for that query.",
     };
   }
 
   // Stage L, M, N: 2nd-Stage Cohere/BGE Reranker (> 0.75 threshold -> Top 5 Chunks)
   const top5SelectedChunks = await rerankCandidates(
-    sparseQuery,
+    denseQuery,
     rrfCandidates,
     opts,
   );
 
   // Stage N2: Confidence / Abstention Gate
   const topScore = top5SelectedChunks[0]?.relevanceScore ?? 0;
+  const isCatalogQuery = /\b(catalog|catalogs|collection|collections|category|categories|products|items|what do you sell|what do you offer|what do you provide)\b/i.test(cleanedQuery);
+  const minThreshold = isCatalogQuery ? 0.10 : CONFIDENCE_ABSTENTION_THRESHOLD;
   const isAbstained =
     top5SelectedChunks.length === 0 ||
-    topScore < CONFIDENCE_ABSTENTION_THRESHOLD;
+    topScore < minThreshold;
 
   if (isAbstained) {
     console.log(
-      `🛡️ [Confidence Gate] Top relevance score (${topScore.toFixed(3)}) is below threshold (${CONFIDENCE_ABSTENTION_THRESHOLD}). Triggering abstention.`,
+      `🛡️ [Confidence Gate] Top relevance score (${topScore.toFixed(3)}) is below threshold (${minThreshold}). Triggering abstention.`,
     );
     return {
       searchResults: top5SelectedChunks,
