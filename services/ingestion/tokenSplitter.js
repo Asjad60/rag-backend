@@ -113,9 +113,10 @@ function createParentChildChunks(rawText, contextualSummary = '', metadata = {})
 
   parentRawTexts.forEach((pText, pIndex) => {
     const parentId = `parent_${pIndex}_${countTokens(pText)}`;
+    const titlePrefix = metadata.pageTitle ? `[Page: ${metadata.pageTitle}]\n` : '';
     const pSummaryText = contextualSummary
-      ? `[Document Context: ${contextualSummary}]\n\n${pText}`
-      : pText;
+      ? `${titlePrefix}[Document Context: ${contextualSummary}]\n\n${pText}`
+      : `${titlePrefix}${pText}`;
 
     const parentObj = {
       parentId,
@@ -132,8 +133,8 @@ function createParentChildChunks(rawText, contextualSummary = '', metadata = {})
 
     childRawTexts.forEach((cText, cIndex) => {
       const childSummaryText = contextualSummary
-        ? `[Document Context: ${contextualSummary}]\n\n${cText}`
-        : cText;
+        ? `${titlePrefix}[Document Context: ${contextualSummary}]\n\n${cText}`
+        : `${titlePrefix}${cText}`;
 
       const childObj = {
         childIndex: `${pIndex}_${cIndex}`,

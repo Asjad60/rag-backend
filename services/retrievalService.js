@@ -12,10 +12,10 @@ const { getCollectionName } = require("./scraperService");
 const { parseEcommerceQuery } = require("./retrieval/ecommerceQueryParser");
 
 const INTENT_PAGE_TYPE_FILTER = {
-  product: ["product_page", "collection_page", "category_page", "pricing_page", "service_page", "homepage", "general_page", "faq_page", "blog_page"],
-  contact: ["contact_page", "homepage"],
-  about: ["about_page", "homepage", "collection_page", "category_page", "general_page"],
-  faq: ["faq_page", "general_page"],
+  product: [],
+  contact: [],
+  about: [],
+  faq: [],
   navigation: [],
   general: [],
 };

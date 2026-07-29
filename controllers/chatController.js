@@ -244,7 +244,7 @@ exports.chat = async (req, res) => {
 
     // ── Confidence / Abstention Gate Triggered ─────────────────────────────
     if (isAbstained) {
-      let reply = abstentionMessage || `I could not find sufficient information regarding your query in ${bot.businessName || "our catalog"}. Would you like me to connect you with customer support?`;
+      let reply = abstentionMessage || `I could not find sufficient information regarding your query in ${bot.businessName || "our knowledge base"}. Would you like me to connect you with support?`;
       if (isNonEnglish) {
         reply = await generateChatResponse(
           botMeta,

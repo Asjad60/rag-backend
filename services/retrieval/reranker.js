@@ -2,8 +2,8 @@ const axios = require("axios");
 const { callOpenRouterChat } = require("../llmService");
 const { logLlmUsage } = require("../llmUsageService");
 
-const RERANK_SCORE_THRESHOLD = 0.60;
-const CONFIDENCE_ABSTENTION_THRESHOLD = 0.25;
+const RERANK_SCORE_THRESHOLD = 0.10;
+const CONFIDENCE_ABSTENTION_THRESHOLD = 0.05;
 const MAX_RERANKED_TOP_K = 5;
 
 /* ============================================================================
@@ -130,22 +130,23 @@ async function bgeRerank(query, documents, options = {}) {
         }).catch(() => {});
 
         return scores.map((item, index) => {
-          let rawScore = 0.5;
+          let hfScore = 0.5;
           if (typeof item === "number") {
-            rawScore = item;
+            hfScore = item;
           } else if (item && typeof item === "object") {
-            // HF Serverless Inference API wraps BGE Reranker scores under item.score (label: LABEL_0)
-            rawScore = typeof item.score === "number" ? item.score : 0.5;
+            hfScore = typeof item.score === "number" ? item.score : 0.5;
           }
 
-          const normalizedScore =
-            rawScore > 1.0 || rawScore < 0.0
-              ? 1.0 / (1.0 + Math.exp(-rawScore))
-              : rawScore;
+          // Bound hfScore to prevent log(0) / infinity
+          const safeScore = Math.max(Math.min(hfScore, 0.999999), 1e-10);
+          // Reconstruct raw BGE-Reranker logit z = ln(s / (1 - s))
+          const logit = Math.log(safeScore / (1 - safeScore));
+          // Calibrate BGE-v2-m3 logits onto standard 0.0 - 1.0 relevance scale
+          const calibratedScore = 1.0 / (1.0 + Math.exp(-(logit + 4.5) / 1.5));
 
           return {
             index,
-            relevanceScore: parseFloat(normalizedScore.toFixed(4)),
+            relevanceScore: parseFloat(calibratedScore.toFixed(4)),
           };
         });
       }
