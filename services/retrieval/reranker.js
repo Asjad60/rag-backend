@@ -122,17 +122,6 @@ async function bgeRerank(query, documents, options = {}) {
       const scores = Array.isArray(rawData[0]) ? rawData[0] : rawData;
 
       if (Array.isArray(scores) && scores.length > 0) {
-        // Detect broken HF serverless router output (TextClassification pipeline returning LABEL_0)
-        const isTextClassificationOutput = scores.some(
-          (item) => typeof item === "object" && item && "label" in item
-        );
-        if (isTextClassificationOutput) {
-          console.warn(
-            "⚠️ HuggingFace router returned TextClassification pipeline labels instead of reranker logits. Falling back to OpenRouter Cross-Encoder."
-          );
-          return null;
-        }
-
         logLlmUsage({
           botId: options.botId,
           sessionId: options.sessionId,
@@ -141,11 +130,19 @@ async function bgeRerank(query, documents, options = {}) {
         }).catch(() => {});
 
         return scores.map((item, index) => {
-          const rawScore = typeof item === "number" ? item : (item.score ?? 0.5);
+          let rawScore = 0.5;
+          if (typeof item === "number") {
+            rawScore = item;
+          } else if (item && typeof item === "object") {
+            // HF Serverless Inference API wraps BGE Reranker scores under item.score (label: LABEL_0)
+            rawScore = typeof item.score === "number" ? item.score : 0.5;
+          }
+
           const normalizedScore =
             rawScore > 1.0 || rawScore < 0.0
               ? 1.0 / (1.0 + Math.exp(-rawScore))
               : rawScore;
+
           return {
             index,
             relevanceScore: parseFloat(normalizedScore.toFixed(4)),
