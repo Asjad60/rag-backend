@@ -344,7 +344,7 @@ async function scrapeAndStore(botId, rootUrl) {
   );
 
   // Stage 2: Batch Scraping & Ingestion
-  const allPoints = [];
+  let totalPointsCount = 0;
   let pagesScraped = 0;
   let businessName = "";
   const visited = new Set();
@@ -404,7 +404,17 @@ async function scrapeAndStore(botId, rootUrl) {
           businessName = pageTitle.replace(/\s*[-|–]\s*.+$/, "").trim();
         }
 
-        allPoints.push(...points);
+        // Stage 3: Immediate per-page flush to Qdrant (prevents RAM bloat)
+        if (points && points.length > 0) {
+          const UPSERT_BATCH = 100;
+          for (let k = 0; k < points.length; k += UPSERT_BATCH) {
+            await qdrantClient.upsert(collectionName, {
+              points: points.slice(k, k + UPSERT_BATCH),
+            });
+          }
+          totalPointsCount += points.length;
+        }
+
         pagesScraped++;
 
         await Document.findOneAndUpdate(
@@ -422,7 +432,7 @@ async function scrapeAndStore(botId, rootUrl) {
         );
 
         console.log(
-          `✅ [${pagesScraped}/${urlQueue.length}] ${url} — ${points.length} child points (${parentCount} parent chunks)`,
+          `✅ [${pagesScraped}/${urlQueue.length}] ${url} — ${points.length} child points (${parentCount} parent chunks) [flushed to Qdrant]`,
         );
       } else {
         console.warn(
@@ -438,26 +448,18 @@ async function scrapeAndStore(botId, rootUrl) {
     }
   }
 
-  if (allPoints.length === 0) {
+  if (totalPointsCount === 0) {
     throw new Error(
       "No valid content could be extracted or passed quality gates from the provided URL(s)",
     );
   }
 
-  // Stage 3: Batch Upsert to Qdrant
-  const UPSERT_BATCH = 100;
-  for (let i = 0; i < allPoints.length; i += UPSERT_BATCH) {
-    await qdrantClient.upsert(collectionName, {
-      points: allPoints.slice(i, i + UPSERT_BATCH),
-    });
-  }
-
   console.log(
-    `✅ Successfully upserted ${allPoints.length} points to Qdrant collection "${collectionName}" with native BM25 sparse vectors`,
+    `✅ Successfully upserted total ${totalPointsCount} points across ${pagesScraped} pages to Qdrant collection "${collectionName}"`,
   );
   return {
     success: true,
-    chunksCount: allPoints.length,
+    chunksCount: totalPointsCount,
     pagesScraped,
     businessName,
   };
