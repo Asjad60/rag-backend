@@ -65,7 +65,7 @@ async function processPageForIngestion(rawInput, url = "", options = {}) {
     structures,
   );
   console.log(
-    `  ├─ Stage G-H (Parent-Child Chunks): ${parentChunks.length} Parents (850 tokens), ${childChunks.length} Children (180 tokens)`,
+    `  ├─ Stage G-H (Parent-Child Chunks): ${parentChunks.length} Parents (850 tokens), ${childChunks.length} Children (350 tokens)`,
   );
 
   // Stages I–L: Dense Embedding + Native BM25 Sparse + Deterministic UUID

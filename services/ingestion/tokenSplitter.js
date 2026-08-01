@@ -132,8 +132,8 @@ function createParentChildChunks(
   const enc = getTokenizer();
 
   const PARENT_TARGET_TOKENS = 850;
-  const CHILD_TARGET_TOKENS = 180;
-  const CHILD_OVERLAP_TOKENS = 30;
+  const CHILD_TARGET_TOKENS = 350;
+  const CHILD_OVERLAP_TOKENS = 50;
 
   // Use structural blocks if available, preserving tables and code blocks intact
   let sourceText = rawText;
