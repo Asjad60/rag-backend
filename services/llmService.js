@@ -58,6 +58,91 @@ async function callOpenRouterChat({
   return content.trim();
 }
 
+/**
+ * Helper to execute chat completions via OpenRouter with streaming.
+ */
+async function callOpenRouterChatStream({
+  messages,
+  temperature = 0,
+  maxTokens = 600,
+  model = OPENROUTER_CHAT_MODEL,
+  operation = "chat_response",
+  botId = null,
+  sessionId = "",
+  onToken,
+}) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+
+  const response = await axios.post(
+    "https://openrouter.ai/api/v1/chat/completions",
+    {
+      model,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+      stream: true,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://ragchatbot.local",
+        "X-Title": "RAG Chatbot",
+      },
+      responseType: "stream",
+      timeout: 30_000,
+    },
+  );
+
+  return new Promise((resolve, reject) => {
+    let fullText = "";
+    let buffer = "";
+
+    response.data.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(":")) continue;
+        if (trimmed === "data: [DONE]") continue;
+
+        if (trimmed.startsWith("data: ")) {
+          try {
+            const dataStr = trimmed.slice(6);
+            const parsed = JSON.parse(dataStr);
+            const token = parsed.choices?.[0]?.delta?.content || "";
+            if (token) {
+              fullText += token;
+              if (onToken) onToken(token);
+            }
+          } catch (_) {}
+        }
+      }
+    });
+
+    response.data.on("end", () => {
+      if (buffer.trim().startsWith("data: ") && buffer.trim() !== "data: [DONE]") {
+        try {
+          const parsed = JSON.parse(buffer.trim().slice(6));
+          const token = parsed.choices?.[0]?.delta?.content || "";
+          if (token) {
+            fullText += token;
+            if (onToken) onToken(token);
+          }
+        } catch (_) {}
+      }
+      resolve(fullText.trim());
+    });
+
+    response.data.on("error", (err) => {
+      reject(err);
+    });
+  });
+}
+
 // ─── Intent Patterns ──────────────────────────────────────────────────────────
 
 const INTENT_PATTERNS = {
@@ -283,6 +368,60 @@ async function generateChatResponse(
   }
 }
 
+async function generateChatResponseStream(
+  botMeta,
+  contextText,
+  chatHistory,
+  intent = "general",
+  langName = "English",
+  options = {},
+  onToken,
+) {
+  const { businessName, websiteUrl, systemPrompt } = botMeta;
+  const identity = businessName
+    ? `You are the AI assistant for ${businessName}${websiteUrl ? ` (${websiteUrl})` : ""}.`
+    : "You are an AI assistant for a website.";
+
+  const basePrompt = buildDefaultSystemPrompt(botMeta, contextText);
+  const langPrompt = `\n\nIMPORTANT: The user is speaking ${langName}. You MUST write your final response strictly in ${langName}. Do NOT reply in English unless the user spoke English. Base your answer entirely on the context provided above.`;
+
+  const systemMessage = {
+    role: "system",
+    content: basePrompt + langPrompt,
+  };
+
+  const recentHistory = (chatHistory || []).slice(-4);
+  const formattedHistory = recentHistory.map((msg) => {
+    const isAssistant = msg.role === "assistant";
+    let content = msg.content || "";
+    if (isAssistant && content.length > 250) {
+      content = content.slice(0, 250) + "...";
+    }
+    return {
+      role: isAssistant ? "assistant" : "user",
+      content,
+    };
+  });
+
+  try {
+    const reply = await callOpenRouterChatStream({
+      messages: [systemMessage, ...formattedHistory],
+      temperature: 0.1,
+      maxTokens: 650,
+      operation: "chat_response",
+      botId: options.botId,
+      sessionId: options.sessionId,
+      onToken,
+    });
+    return reply;
+  } catch (error) {
+    console.error("❌ OpenRouter LLM Streaming API Error:", error.message);
+    throw new Error(
+      `Failed to generate response from OpenRouter: ${error.message}`,
+    );
+  }
+}
+
 // ─── System Prompt Builder ────────────────────────────────────────────────────
 
 function buildDefaultSystemPrompt(botMeta = {}, contextText = "") {
@@ -333,10 +472,12 @@ ${contextText || "No context available."}`;
 
 module.exports = {
   callOpenRouterChat,
+  callOpenRouterChatStream,
   detectIntent,
   getRoutingBranch,
   augmentQuery,
   checkGuardrails,
   generateClarifyResponse,
   generateChatResponse,
+  generateChatResponseStream,
 };

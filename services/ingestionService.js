@@ -62,6 +62,7 @@ async function processPageForIngestion(rawInput, url = "", options = {}) {
     normalized.rawText,
     contextualSummary,
     pageMeta,
+    structures,
   );
   console.log(
     `  ├─ Stage G-H (Parent-Child Chunks): ${parentChunks.length} Parents (850 tokens), ${childChunks.length} Children (180 tokens)`,

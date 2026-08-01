@@ -53,28 +53,37 @@ async function executeRetrievalPipeline(
 
   const cleanedQuery = (query || "").trim();
 
-  // Stage D-pre: Resolve pronouns & implicit follow-up subjects (e.g. "give me the link" -> "Product Name give me the link")
-  const { resolvedQuery, wasResolved } = await resolveAmbiguousPronouns(
-    cleanedQuery,
-    chatHistory,
-    opts,
-  );
+  // Stage D-pre & Stage D0: Run Pronoun Resolution and E-Commerce Constraint Parsing in Parallel
+  const [pronounResult, ecomConstraints] = await Promise.all([
+    resolveAmbiguousPronouns(cleanedQuery, chatHistory, opts),
+    parseEcommerceQuery(cleanedQuery, opts),
+  ]);
+
+  const { resolvedQuery, wasResolved } = pronounResult;
   const baseQuery = wasResolved ? resolvedQuery : cleanedQuery;
 
-  // Stage D0: E-Commerce Attribute & Comparison Parsing
-  const ecomConstraints = await parseEcommerceQuery(baseQuery, opts);
-
-  // Construct Qdrant extra payload filters (e.g. priceNumeric range)
-  let extraFilter = null;
+  // Construct Qdrant extra payload filters (e.g. priceNumeric range, inStock)
+  const mustFilters = [];
   if (ecomConstraints.maxPrice !== null) {
-    extraFilter = {
+    mustFilters.push({
       key: "priceNumeric",
       range: { lte: ecomConstraints.maxPrice },
-    };
+    });
     console.log(
       `🏷️ [Qdrant Payload Filter] Applying price filter: priceNumeric <= ${ecomConstraints.maxPrice}`,
     );
   }
+  if (ecomConstraints.inStockOnly) {
+    mustFilters.push({
+      key: "inStock",
+      match: { value: true },
+    });
+    console.log(
+      `🏷️ [Qdrant Payload Filter] Applying stock filter: inStock == true`,
+    );
+  }
+
+  const extraFilter = mustFilters.length > 0 ? mustFilters : null;
 
   const targetSearchQuery = ecomConstraints.cleanSearchQuery || baseQuery;
 
@@ -101,23 +110,30 @@ async function executeRetrievalPipeline(
       `🔀 [Comparison Retrieval] Multi-entity comparison detected for: "${ecomConstraints.comparisonEntities.join(" vs ")}"`,
     );
 
-    // Execute balanced sub-retrievals for each compared entity concurrently
-    const subSearchResults = await Promise.all(
-      ecomConstraints.comparisonEntities.map(async (entity) => {
-        const subQuery = `${entity} product description price specs features`;
-        const dVec = await generateEmbeddings(subQuery, {
+    // 1. Generate dense vector embeddings for all comparison entities concurrently
+    const entityQueries = ecomConstraints.comparisonEntities.map(
+      (entity) => `${entity} product description price specs features`,
+    );
+    const dVectors = await Promise.all(
+      entityQueries.map((subQuery) =>
+        generateEmbeddings(subQuery, {
           ...opts,
           operation: "dense_embedding",
-        });
-        // Pass entity name as sparse query text — Qdrant/bm25 handles tokenisation
-        return executeHybridSearch(
+        }),
+      ),
+    );
+
+    // 2. Execute balanced hybrid searches concurrently for each entity
+    const subSearchResults = await Promise.all(
+      ecomConstraints.comparisonEntities.map((entity, idx) =>
+        executeHybridSearch(
           collectionName,
-          dVec,
+          dVectors[idx],
           entity,
           allowedPageTypes,
           extraFilter,
-        );
-      }),
+        ),
+      ),
     );
 
     // Interleave candidate chunks to guarantee balanced context for both products
@@ -164,7 +180,7 @@ async function executeRetrievalPipeline(
     };
   }
 
-  // Stage L, M, N: 2nd-Stage Cohere/BGE Reranker (> 0.75 threshold -> Top 5 Chunks)
+  // Stage L, M, N: 2nd-Stage Reranker (Jina AI / BGE / Cohere / None via .env) -> Top 5 Chunks
   const top5SelectedChunks = await rerankCandidates(
     denseQuery,
     rrfCandidates,

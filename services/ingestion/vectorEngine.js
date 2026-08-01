@@ -72,6 +72,7 @@ async function vectorizeChunks(childChunks, url, options = {}) {
         tokenCount: chunk.tokenCount || 0,
         priceNumeric: chunk.ecommerceMeta?.priceNumeric ?? null,
         currency: chunk.ecommerceMeta?.currency || null,
+        inStock: chunk.ecommerceMeta?.inStock ?? null,
         colors: chunk.ecommerceMeta?.colors || [],
         sizes: chunk.ecommerceMeta?.sizes || [],
       },

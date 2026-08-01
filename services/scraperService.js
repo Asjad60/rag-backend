@@ -7,7 +7,7 @@ const { processPageForIngestion } = require("./ingestionService");
 const Document = require("../models/Document");
 
 const MAX_CRAWL_PAGES = 500;
-const PAGE_CONCURRENCY = 5; // pages scraped in parallel per batch
+const PAGE_CONCURRENCY = 1; // pages scraped in parallel per batch
 
 // ─── Per-Bot Collection Naming ────────────────────────────────────────────────
 

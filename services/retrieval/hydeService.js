@@ -63,7 +63,7 @@ async function resolveAmbiguousPronouns(query, chatHistory = [], options = {}) {
     return { resolvedQuery: resolved, wasResolved: true };
   }
 
-  // Tier 2: LLM Contextual Query Rewriter
+  // Tier 2: LLM Contextual Query Rewriter with 2.5s safety timeout
   try {
     const historyText = recentHistory.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
     const systemPrompt = `You are a Contextual Query Rewriter for search engines.
@@ -74,7 +74,7 @@ Given the recent chat history and a user's follow-up query, rewrite the user que
 
     const userPrompt = `Chat History:\n${historyText}\n\nUser Query: "${trimmed}"\n\nStandalone Search Query:`;
 
-    const rewritten = await callOpenRouterChat({
+    const llmPromise = callOpenRouterChat({
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
@@ -85,6 +85,12 @@ Given the recent chat history and a user's follow-up query, rewrite the user que
       botId: options.botId,
       sessionId: options.sessionId,
     });
+
+    const timeoutPromise = new Promise((resolve) =>
+      setTimeout(() => resolve(null), 2500)
+    );
+
+    const rewritten = await Promise.race([llmPromise, timeoutPromise]);
 
     const cleanRewritten =
       typeof rewritten === "string"
@@ -239,7 +245,7 @@ Do NOT output greetings, preamble, or meta-comments. Output ONLY the raw hypothe
     : `User Query: ${trimmed}\n\nHypothetical Document Snippet:`;
 
   try {
-    const hydeText = await callOpenRouterChat({
+    const llmPromise = callOpenRouterChat({
       messages: [
         { role: "system", content: systemInstruction },
         { role: "user", content: userPrompt },
@@ -250,6 +256,12 @@ Do NOT output greetings, preamble, or meta-comments. Output ONLY the raw hypothe
       botId: options.botId,
       sessionId: options.sessionId,
     });
+
+    const timeoutPromise = new Promise((resolve) =>
+      setTimeout(() => resolve(""), 2500)
+    );
+
+    const hydeText = await Promise.race([llmPromise, timeoutPromise]);
 
     const cleanHyDE = typeof hydeText === "string" ? hydeText.trim() : "";
     const expandedQuery = cleanHyDE ? `${trimmed}\n\n${cleanHyDE}` : trimmed;

@@ -44,54 +44,59 @@ async function executeHybridSearch(
   let denseResults = [];
   let sparseResults = [];
 
-  // 1. Retrieve Top 30 Dense Vectors (Stage I)
-  try {
-    denseResults = await qdrantClient.search(collectionName, {
-      vector: denseVector,
-      limit: 30,
-      filter,
-      with_payload: true,
-      score_threshold: 0.05,
-    });
-  } catch (e) {
-    const msg = e.message || "";
-    if (!msg.toLowerCase().includes("not found") && !msg.includes("404")) {
-      console.error("❌ Qdrant dense search error:", e.message);
+  // 1 & 2. Retrieve Top 30 Dense Vectors (Stage I) & Top 30 Sparse Matches (Stage J) in Parallel
+  const densePromise = (async () => {
+    let res = [];
+    try {
+      res = await qdrantClient.search(collectionName, {
+        vector: denseVector,
+        limit: 30,
+        filter,
+        with_payload: true,
+        score_threshold: 0.05,
+      });
+    } catch (e) {
+      const msg = e.message || "";
+      if (!msg.toLowerCase().includes("not found") && !msg.includes("404")) {
+        console.error("❌ Qdrant dense search error:", e.message);
+      }
     }
-  }
 
-  // Fallback 1: If dense search with strict extra filter returned 0, retry with pageType filter only
-  if (denseResults.length === 0 && extraFilter) {
-    console.log(
-      "⚠️ [Hybrid Search] Strict payload filter returned 0 points — falling back to pageType filter",
-    );
-    const fallbackFilter =
-      allowedPageTypes.length > 0
-        ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
-        : undefined;
-    try {
-      denseResults = await qdrantClient.search(collectionName, {
-        vector: denseVector,
-        limit: 30,
-        filter: fallbackFilter,
-        with_payload: true,
-      });
-    } catch (_) {}
-  }
+    // Fallback 1: If dense search with strict extra filter returned 0, retry with pageType filter only
+    if (res.length === 0 && extraFilter) {
+      console.log(
+        "⚠️ [Hybrid Search] Strict payload filter returned 0 points — falling back to pageType filter",
+      );
+      const fallbackFilter =
+        allowedPageTypes.length > 0
+          ? { must: [{ key: "pageType", match: { any: allowedPageTypes } }] }
+          : undefined;
+      try {
+        res = await qdrantClient.search(collectionName, {
+          vector: denseVector,
+          limit: 30,
+          filter: fallbackFilter,
+          with_payload: true,
+        });
+      } catch (_) {}
+    }
 
-  // Fallback 2: if dense search still returned 0, retry without any filter
-  if (denseResults.length === 0 && allowedPageTypes.length > 0) {
-    try {
-      denseResults = await qdrantClient.search(collectionName, {
-        vector: denseVector,
-        limit: 30,
-        with_payload: true,
-      });
-    } catch (_) {}
-  }
+    // Fallback 2: if dense search still returned 0, retry without any filter
+    if (res.length === 0 && allowedPageTypes.length > 0) {
+      try {
+        res = await qdrantClient.search(collectionName, {
+          vector: denseVector,
+          limit: 30,
+          with_payload: true,
+        });
+      } catch (_) {}
+    }
 
-  // 2. Retrieve Top 30 Sparse Matches via Native Qdrant BM25 (Stage J)
-  if (sparseQueryText && sparseQueryText.trim().length > 0) {
+    return res;
+  })();
+
+  const sparsePromise = (async () => {
+    if (!sparseQueryText || !sparseQueryText.trim().length) return [];
     try {
       const queryResult = await qdrantClient.query(collectionName, {
         query: {
@@ -103,16 +108,19 @@ async function executeHybridSearch(
         filter,
         with_payload: true,
       });
-      // .query() returns { points: [...] } — normalise to flat array
-      sparseResults = queryResult?.points ?? queryResult ?? [];
+      return queryResult?.points ?? queryResult ?? [];
     } catch (e) {
       console.warn(
-        "⚠️ [Hybrid Search] Native BM25 sparse query failed (legacy collection) — using dense fallback:",
+        "⚠️ [Hybrid Search] Native BM25 sparse query failed (legacy collection):",
         e.message
       );
-      sparseResults = denseResults;
+      return [];
     }
-  }
+  })();
+
+  const [denseRes, sparseRes] = await Promise.all([densePromise, sparsePromise]);
+  denseResults = denseRes;
+  sparseResults = sparseRes;
 
   // 3. Apply Reciprocal Rank Fusion (RRF) (Stage K)
   const candidateMap = new Map();

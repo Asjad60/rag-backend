@@ -2,6 +2,7 @@ const Bot = require("../models/Bot");
 const mongoose = require("mongoose");
 const {
   generateChatResponse,
+  generateChatResponseStream,
   generateClarifyResponse,
   detectIntent,
   getRoutingBranch,
@@ -63,7 +64,7 @@ function buildContextText(searchResults) {
 
 exports.chat = async (req, res) => {
   try {
-    const { botId, message, chatHistory = [], sessionId = "" } = req.body;
+    const { botId, message, chatHistory = [], sessionId = "", stream = false } = req.body;
 
     // ── Validation ───────────────────────────────────────────────────────────
     if (!botId || !mongoose.isValidObjectId(botId)) {
@@ -88,6 +89,30 @@ exports.chat = async (req, res) => {
     };
 
     const opts = { botId, sessionId };
+
+    const isStreaming = stream === true || req.headers.accept === "text/event-stream";
+
+    if (isStreaming) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      if (res.flushHeaders) res.flushHeaders();
+    }
+
+    const sendResponse = async ({ reply, intent, detectedLang, logId, isAbstained = false, onStreamReply = false }) => {
+      if (isStreaming) {
+        if (!onStreamReply) {
+          res.write(`data: ${JSON.stringify({ type: "meta", intent, detectedLang, isAbstained })}\n\n`);
+          if (reply) {
+            res.write(`data: ${JSON.stringify({ type: "token", token: reply })}\n\n`);
+          }
+        }
+        res.write(`data: ${JSON.stringify({ type: "done", logId, intent, detectedLang, isAbstained })}\n\n`);
+        return res.end();
+      } else {
+        return res.json({ reply, intent, detectedLang, ...(isAbstained && { isAbstained }), ...(logId && { logId }) });
+      }
+    };
 
     // ── Stage 1: Language Detection + Query Translation ───────────────────────
     const { detectedLang, langName, isNonEnglish, translatedQuery } =
@@ -114,7 +139,7 @@ exports.chat = async (req, res) => {
           opts
         );
       }
-      logChatEvent({
+      const logId = await logChatEvent({
         botId,
         sessionId,
         detectedLang,
@@ -127,7 +152,7 @@ exports.chat = async (req, res) => {
         chunksRetrieved: 0,
         guardrailFired: false,
       });
-      return res.json({ reply, intent: "gratitude", detectedLang });
+      return sendResponse({ reply, intent: "gratitude", detectedLang, logId });
     }
 
     // ── Branch: Greeting ──────────────────────────────────────────────────────
@@ -163,7 +188,7 @@ exports.chat = async (req, res) => {
           opts
         );
       }
-      logChatEvent({
+      const logId = await logChatEvent({
         botId,
         sessionId,
         detectedLang,
@@ -176,7 +201,7 @@ exports.chat = async (req, res) => {
         chunksRetrieved: 0,
         guardrailFired: false,
       });
-      return res.json({ reply, intent: "greeting", detectedLang });
+      return sendResponse({ reply, intent: "greeting", detectedLang, logId });
     }
 
     // ── Stage 5 (pre-LLM): Guardrails ────────────────────────────────────────
@@ -196,7 +221,7 @@ exports.chat = async (req, res) => {
       console.warn(
         `🛡️  [Guardrail] Fired (${guardrail.reason}) for bot=${botId}`,
       );
-      logChatEvent({
+      const logId = await logChatEvent({
         botId,
         sessionId,
         detectedLang,
@@ -209,13 +234,13 @@ exports.chat = async (req, res) => {
         chunksRetrieved: 0,
         guardrailFired: true,
       });
-      return res.json({ reply, intent, detectedLang });
+      return sendResponse({ reply, intent, detectedLang, logId });
     }
 
     // ── Branch: Clarify (Stage 3C) ─────────────────────────────────────────
     if (branch === "clarify") {
       const reply = await generateClarifyResponse(botMeta, message, langName, opts);
-      logChatEvent({
+      const logId = await logChatEvent({
         botId,
         sessionId,
         detectedLang,
@@ -228,7 +253,7 @@ exports.chat = async (req, res) => {
         chunksRetrieved: 0,
         guardrailFired: false,
       });
-      return res.json({ reply, intent, detectedLang });
+      return sendResponse({ reply, intent, detectedLang, logId });
     }
 
     // ── Execute Advanced RAG Retrieval Pipeline (HyDE + RRF + Cohere Reranker + Parent Resolution)
@@ -268,7 +293,7 @@ exports.chat = async (req, res) => {
         chunksRetrieved: 0,
         guardrailFired: false,
       });
-      return res.json({ reply, intent, detectedLang, isAbstained: true, ...(logId && { logId }) });
+      return sendResponse({ reply, intent, detectedLang, logId, isAbstained: true });
     }
 
     const ragPath = branch === "product" ? "structured" : "semantic";
@@ -285,14 +310,31 @@ exports.chat = async (req, res) => {
     // ── Stage 5: LLM Generation (Grounded) ────────────────────────────────
     console.log(`🤖 [Stage 5 LLM Generation] Sending query to OpenRouter...`);
     const fullHistory = [...chatHistory, { role: "user", content: message }];
-    const reply = await generateChatResponse(
-      botMeta,
-      contextText,
-      fullHistory,
-      intent,
-      langName,
-      opts
-    );
+    let reply = "";
+
+    if (isStreaming) {
+      res.write(`data: ${JSON.stringify({ type: "meta", intent, detectedLang })}\n\n`);
+      reply = await generateChatResponseStream(
+        botMeta,
+        contextText,
+        fullHistory,
+        intent,
+        langName,
+        opts,
+        (token) => {
+          res.write(`data: ${JSON.stringify({ type: "token", token })}\n\n`);
+        }
+      );
+    } else {
+      reply = await generateChatResponse(
+        botMeta,
+        contextText,
+        fullHistory,
+        intent,
+        langName,
+        opts
+      );
+    }
 
     // ── Stage 6: Analytics Log ─────────────────────────────────────────────
     const logId = await logChatEvent({
@@ -309,10 +351,15 @@ exports.chat = async (req, res) => {
       guardrailFired: false,
     });
 
-    return res.json({ reply, intent, detectedLang, ...(logId && { logId }) });
+    return sendResponse({ reply, intent, detectedLang, logId, onStreamReply: isStreaming });
   } catch (error) {
     console.error("❌ Chat error:", error);
-    res.status(500).json({ message: "Chat error", error: error.message });
+    if (res.headersSent) {
+      res.write(`data: ${JSON.stringify({ type: "error", message: error.message })}\n\n`);
+      res.end();
+    } else {
+      res.status(500).json({ message: "Chat error", error: error.message });
+    }
   }
 };
 

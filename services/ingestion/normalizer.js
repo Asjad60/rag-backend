@@ -807,9 +807,21 @@ function extractEcommerceMetadata(rawText = "") {
       sizes.push(szVal);
     }
   }
+  // Stock / Availability extraction
+  let inStock = null;
+  const isOutOfStock = /\b(out\s+of\s+stock|outofstock|out-of-stock|sold\s+out|currently\s+unavailable|backorder|un-available)\b/i.test(rawText);
+  const isInStock = /\b(in\s+stock|instock|in-stock|add\s+to\s+cart|add\s+to\s+bag|buy\s+now|ready\s+to\s+ship|available\s+now)\b/i.test(rawText);
+
+  if (isOutOfStock) {
+    inStock = false;
+  } else if (isInStock) {
+    inStock = true;
+  }
+
   return {
     priceNumeric,
     currency,
+    inStock,
     colors: [...new Set(colors)],
     sizes: [...new Set(sizes)],
   };
