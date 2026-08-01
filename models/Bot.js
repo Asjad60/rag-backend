@@ -11,6 +11,8 @@ const BotSchema = new mongoose.Schema({
     default: "Hi! I'm your AI assistant. Ask me anything about this website.",
   },
   systemPrompt: { type: String, default: "" },
+  role: { type: String, default: "general_assistant" },
+  businessSummary: { type: String, default: "" },
   colorScheme: { type: String, default: "#3B82F6" },
   createdAt: { type: Date, default: Date.now },
 });

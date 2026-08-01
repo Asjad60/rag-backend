@@ -20,6 +20,15 @@ const PRICING_REGISTRY = {
   "BAAI/bge-reranker-v2-m3": {
     perRequest: 0, // Free open-source reranker
   },
+  "jina/jina-reranker-v3": {
+    perRequest: 0.00002,
+  },
+  "jina-reranker-v3": {
+    perRequest: 0.00002,
+  },
+  "jinaai/jina-reranker-v2-base-multilingual": {
+    perRequest: 0.00002,
+  },
   "cohere/rerank-v3.5": {
     perRequest: 0.001,
   },

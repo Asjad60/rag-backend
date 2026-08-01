@@ -5,7 +5,7 @@ const { scrapeAndStore, deleteCollection } = require('../services/scraperService
 
 exports.createBot = async (req, res) => {
   try {
-    const { userId, name, businessName, description, websiteUrl, welcomeMessage, systemPrompt, colorScheme } = req.body;
+    const { userId, name, businessName, description, websiteUrl, welcomeMessage, systemPrompt, role, businessSummary, colorScheme } = req.body;
     const bot = new Bot({
       userId,
       name,
@@ -14,6 +14,8 @@ exports.createBot = async (req, res) => {
       websiteUrl:     websiteUrl || '',
       welcomeMessage: welcomeMessage || `Hi! I'm the AI assistant for ${businessName || name}. Ask me anything!`,
       systemPrompt:   systemPrompt || '',
+      role:           role || 'general_assistant',
+      businessSummary: businessSummary || '',
       colorScheme:    colorScheme || '#3B82F6',
     });
     await bot.save();

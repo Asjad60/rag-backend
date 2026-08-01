@@ -58,6 +58,91 @@ async function callOpenRouterChat({
   return content.trim();
 }
 
+/**
+ * Helper to execute chat completions via OpenRouter with streaming.
+ */
+async function callOpenRouterChatStream({
+  messages,
+  temperature = 0,
+  maxTokens = 600,
+  model = OPENROUTER_CHAT_MODEL,
+  operation = "chat_response",
+  botId = null,
+  sessionId = "",
+  onToken,
+}) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+
+  const response = await axios.post(
+    "https://openrouter.ai/api/v1/chat/completions",
+    {
+      model,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+      stream: true,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://ragchatbot.local",
+        "X-Title": "RAG Chatbot",
+      },
+      responseType: "stream",
+      timeout: 30_000,
+    },
+  );
+
+  return new Promise((resolve, reject) => {
+    let fullText = "";
+    let buffer = "";
+
+    response.data.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(":")) continue;
+        if (trimmed === "data: [DONE]") continue;
+
+        if (trimmed.startsWith("data: ")) {
+          try {
+            const dataStr = trimmed.slice(6);
+            const parsed = JSON.parse(dataStr);
+            const token = parsed.choices?.[0]?.delta?.content || "";
+            if (token) {
+              fullText += token;
+              if (onToken) onToken(token);
+            }
+          } catch (_) {}
+        }
+      }
+    });
+
+    response.data.on("end", () => {
+      if (buffer.trim().startsWith("data: ") && buffer.trim() !== "data: [DONE]") {
+        try {
+          const parsed = JSON.parse(buffer.trim().slice(6));
+          const token = parsed.choices?.[0]?.delta?.content || "";
+          if (token) {
+            fullText += token;
+            if (onToken) onToken(token);
+          }
+        } catch (_) {}
+      }
+      resolve(fullText.trim());
+    });
+
+    response.data.on("error", (err) => {
+      reject(err);
+    });
+  });
+}
+
 // ─── Intent Patterns ──────────────────────────────────────────────────────────
 
 const INTENT_PATTERNS = {
@@ -66,7 +151,7 @@ const INTENT_PATTERNS = {
   gratitude:
     /^(thanks|thank you|thx|appreciate|thank|great|awesome|perfect|cool|ok|okay|nice|sounds good|got it|thank\s*you\s*so\s*much|thanks\s*a\s*lot)[!?.]*$/i,
   product:
-    /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|recommendation|recommend|suggest|suggestion|option|choice|variant|difference|diff|precio|comprar|价格|买|购买|producto|acheter|prix/i,
+    /product|item|catalog|shop|buy|purchase|price|cost|how much|offer|deal|sale|discount|sku|in stock|available|order|compare|pricing|plan|subscription|package|tier|fee|charge|affordable|recommendation|recommend|suggest|suggestion|option|choice|variant|difference|diff|spec|specs|specification|specifications|feature|features|material|fabric|quality|detail|details|precio|comprar|价格|买|购买|producto|acheter|prix/i,
   contact:
     /contact|email|phone|call|reach|address|location|whatsapp|support|help desk|get in touch|contacto|联系|电话|邮箱/i,
   about:
@@ -128,7 +213,7 @@ async function detectIntent(message, options = {}) {
       sessionId: options.sessionId,
     });
 
-    const llmIntent = raw.toLowerCase().trim();
+    const llmIntent = typeof raw === "string" ? raw.toLowerCase().trim() : "";
     const validIntents = [
       "greeting",
       "gratitude",
@@ -244,8 +329,7 @@ async function generateChatResponse(
     ? `You are the AI assistant for ${businessName}${websiteUrl ? ` (${websiteUrl})` : ""}.`
     : "You are an AI assistant for a website.";
 
-  const basePrompt =
-    systemPrompt || buildDefaultSystemPrompt(identity, websiteUrl, contextText);
+  const basePrompt = buildDefaultSystemPrompt(botMeta, contextText);
   const langPrompt = `\n\nIMPORTANT: The user is speaking ${langName}. You MUST write your final response strictly in ${langName}. Do NOT reply in English unless the user spoke English. Base your answer entirely on the context provided above.`;
 
   const systemMessage = {
@@ -284,51 +368,103 @@ async function generateChatResponse(
   }
 }
 
+async function generateChatResponseStream(
+  botMeta,
+  contextText,
+  chatHistory,
+  intent = "general",
+  langName = "English",
+  options = {},
+  onToken,
+) {
+  const { businessName, websiteUrl, systemPrompt } = botMeta;
+  const identity = businessName
+    ? `You are the AI assistant for ${businessName}${websiteUrl ? ` (${websiteUrl})` : ""}.`
+    : "You are an AI assistant for a website.";
+
+  const basePrompt = buildDefaultSystemPrompt(botMeta, contextText);
+  const langPrompt = `\n\nIMPORTANT: The user is speaking ${langName}. You MUST write your final response strictly in ${langName}. Do NOT reply in English unless the user spoke English. Base your answer entirely on the context provided above.`;
+
+  const systemMessage = {
+    role: "system",
+    content: basePrompt + langPrompt,
+  };
+
+  const recentHistory = (chatHistory || []).slice(-4);
+  const formattedHistory = recentHistory.map((msg) => {
+    const isAssistant = msg.role === "assistant";
+    let content = msg.content || "";
+    if (isAssistant && content.length > 250) {
+      content = content.slice(0, 250) + "...";
+    }
+    return {
+      role: isAssistant ? "assistant" : "user",
+      content,
+    };
+  });
+
+  try {
+    const reply = await callOpenRouterChatStream({
+      messages: [systemMessage, ...formattedHistory],
+      temperature: 0.1,
+      maxTokens: 650,
+      operation: "chat_response",
+      botId: options.botId,
+      sessionId: options.sessionId,
+      onToken,
+    });
+    return reply;
+  } catch (error) {
+    console.error("❌ OpenRouter LLM Streaming API Error:", error.message);
+    throw new Error(
+      `Failed to generate response from OpenRouter: ${error.message}`,
+    );
+  }
+}
+
 // ─── System Prompt Builder ────────────────────────────────────────────────────
 
-function buildDefaultSystemPrompt(identity, websiteUrl, contextText) {
+function buildDefaultSystemPrompt(botMeta = {}, contextText = "") {
+  const { businessName, websiteUrl, role, businessSummary, systemPrompt } = botMeta;
+
+  if (systemPrompt && systemPrompt.trim().length > 20) {
+    return `${systemPrompt.trim()}\n\nCONTEXT:\n${contextText || "No context available."}`;
+  }
+
+  const name = businessName || "our website";
   const fallback = websiteUrl
     ? `Visit [our website](${websiteUrl}) for more details.`
     : "Please visit our website for more details.";
 
-  return `${identity}
-You are a helpful, professional AI assistant. Provide beautifully formatted, clear, and structured answers using clean Markdown.
+  const roleDescriptions = {
+    shopping_assistant: `Shopping assistant for ${name}, helping customers explore products, compare options, check prices and features, and guide them smoothly.`,
+    customer_support: `Customer support specialist for ${name}, assisting with orders, policies, services, hours, and general customer inquiries.`,
+    lead_generation: `Sales and lead generation representative for ${name}, answering product and service questions and guiding potential clients to get in touch.`,
+    technical_support: `Technical support representative for ${name}, helping users troubleshoot issues, understand specifications, and follow step-by-step guides.`,
+    general_assistant: `AI Assistant for ${name}, providing helpful, accurate answers about products, services, offerings, and company information.`,
+  };
 
-FORMATTING & STYLE GUIDELINES:
-- Use clean Markdown headers (e.g. ### Section Title) when organizing structured information.
-- Use bold text (**Key Terms**) for key entities, labels, product names, or important details.
-- Use clean bullet points (- ) or numbered lists (1. ) for step-by-step guides, features, specs, or comparisons.
-- DO NOT use markdown tables (| Header 1 | Header 2 |). Instead, format comparisons, features, or specs using clean bullet points (- ), bold headers, or key-value lists so it displays clearly in mobile/chat widgets.
-- Keep responses direct, elegant, and easy to read. Avoid conversational filler or meta-comments like "Based on the context...".
-- Contact info: show email/phone directly. Link contact pages using their exact URL from the context.
-- Base your answer on the CONTEXT below. Synthesize details, specifications, and differences for any items or products mentioned using facts provided in the context.
-- ONLY if the CONTEXT does not contain any facts about the requested topic/product, respond with: "I don't have specific details on that. ${fallback}"
+  const selectedRoleText = roleDescriptions[role] || (typeof role === 'string' && role.trim() ? role.trim() : roleDescriptions.general_assistant);
+  const businessContextSection = businessSummary ? `\n### Business Context\n${businessSummary.trim()}\n` : "";
 
-PRICING & PRODUCT COMPARISON RULES:
-- When listing or comparing multiple products, kits, models, or variants, verify that EVERY price, specification, and feature is matched EXACTLY with its corresponding product name as stated in the context.
-- NEVER mix up, transpose, or swap prices between different products or variants.
-- For comparison or differentiation questions, organize the response into clear sections:
-  1. 💡 **Key Differences** (Bullet points contrasting main attributes like price, material, size, usage)
-  2. 📋 **Product Specifications & Features** (Item-by-item feature breakdown)
-  3. 🎯 **Recommendation / Summary** (Who should buy which product)
+  return `### Role
+${selectedRoleText}
+${businessContextSection}
+### Core Constraints
+1. Exclusive Reliance on Context: Answer strictly using facts provided in the CONTEXT below. Summarize the information, offerings, categories, or items found in the CONTEXT. If a query is completely uncovered by the CONTEXT, respond politely stating you don't have those specific details and suggest: "${fallback}"
+2. Maintain Focus & Role: Stay in character as a helpful assistant for ${name}. Do not perform tasks or answer questions unrelated to the business or site content.
+3. No System Divulging: Never mention that you have access to internal context chunks, database, or training data explicitly to the user.
 
-AVAILABILITY & VARIANT QUESTION RULES:
-- When a user asks about a specific size, color, or variant (or questions why a size is or isn't available):
-  1. Check the exact list of available sizes, colors, and stock in the CONTEXT for that product.
-  2. If the user's requested size or color is NOT listed in the context, state clearly: "According to our product details, [Product Name] is available in [list available sizes/colors from context], but [Requested Size/Color] is not listed as available."
-  3. DO NOT output the fallback message "I don't have specific details on that" if the product itself IS present in the context!
+### Response & Grounding Rules
+1. Factual Grounding: State ONLY facts, features, options, pricing, and links present in the CONTEXT. NEVER invent or guess generic unverified claims.
+2. Link Accuracy: Extract exact page URLs from the matching result block. Format links as [Page/Item Name](URL). Never attach a URL from an unrelated page.
+3. Data Integrity: Treat each information block independently. Never copy, transpose, or mix prices, URLs, or details between neighboring entries.
+4. Missing Details: If specific details requested are NOT in the CONTEXT, answer with what is available in the summary and direct the user to the relevant link.
+5. Inquiries & Overview: If the user asks broadly about what is offered or available, summarize the main topics, products, or services listed in the CONTEXT and invite them to explore.
 
-LINKING & PRODUCT VERIFICATION RULES — follow strictly:
-- The CONTEXT below contains RESULT blocks with "Title:" and "URL:" lines.
-- When the user asks for a link, URL, or webpage link for a specific product (e.g., "give me the link", "show link"):
-  1. Find the RESULT block whose "Title:" matches the product discussed (e.g., "Sunscreen Jacket Ice Pro").
-  2. Extract that exact block's "URL:" and format the link as: [Product Name](URL) or [here](URL).
-  3. NEVER attach a URL from a different product's RESULT block!
-- NON-EXISTENT PRODUCT GUARDRAILS:
-  1. If the user asks for a product, category, or item that is NOT present in the CONTEXT, state clearly that the store does not carry or offer that item.
-  2. NEVER invent, fabricate, guess, or output fictitious product titles or hypothetical URLs that lead to 404 pages.
-  3. You may suggest real alternative products that DO exist in the context.
-- State ONLY the exact sizes, colors, and features listed under that specific product's RESULT block. Never mix or substitute sizes/colors from a different product block.
+### Response Formatting
+- Use Markdown headers (###), bold text, and clean bullet points (-).
+- DO NOT use Markdown tables (| Header 1 | Header 2 |). Format information using clean bullet lists or bold key-value pairs so it displays clearly in mobile chat widgets.
 
 CONTEXT:
 ${contextText || "No context available."}`;
@@ -336,10 +472,12 @@ ${contextText || "No context available."}`;
 
 module.exports = {
   callOpenRouterChat,
+  callOpenRouterChatStream,
   detectIntent,
   getRoutingBranch,
   augmentQuery,
   checkGuardrails,
   generateClarifyResponse,
   generateChatResponse,
+  generateChatResponseStream,
 };

@@ -65,6 +65,15 @@ function parseFastRegEx(query) {
   const numericSizeMatches = qLower.matchAll(/\b(?:size\s*[:=]?\s*|waist\s*[:=]?\s*|uk\s+|us\s+|eu\s+)?(\d{1,2}(?:\.\d)?)\s*(?:size|waist|uk|us|eu)?\b/gi);
   for (const match of numericSizeMatches) {
     const num = match[1];
+    const numVal = parseFloat(num);
+
+    // Skip if number matches the extracted min/max price or looks like a currency/budget figure
+    const isPriceNumber = (maxPrice !== null && numVal === maxPrice) ||
+                          (minPrice !== null && numVal === minPrice) ||
+                          new RegExp(`\\b(?:under|below|above|over|rs\\.?|rupees?|inr|dollars||\\$)\\s*${num}\\b`, "i").test(qLower);
+
+    if (isPriceNumber) continue;
+
     const hasSizeContext = new RegExp(`\\b(?:size\\s*[:=]?\\s*${num}|${num}\\s*size|waist\\s*[:=]?\\s*${num}|${num}\\s*waist|uk\\s+${num}|us\\s+${num}|eu\\s+${num})\\b`, "i").test(qLower);
     if (hasSizeContext && !detectedSizes.includes(num)) {
       detectedSizes.push(num);
@@ -104,6 +113,10 @@ function parseFastRegEx(query) {
     }
   }
 
+  // Stock / Availability intent check
+  const inStockOnly = /\b(in\s+stock|instock|in-stock|available|ready\s+to\s+ship|is\s+it\s+available|are\s+they\s+available|show\s+available|available\s+items)\b/i.test(qLower) &&
+                      !/\b(out\s+of\s+stock|not\s+in\s+stock|un-available|sold\s+out)\b/i.test(qLower);
+
   // Build clean search query for vector search (strips conversational fluff like "how can you say that it does have")
   let cleanSearchQuery = qLower
     .replace(/\b(how can you say that|how come|why do you say|this product does not have|does not have|how to buy|can you tell me if|i want to know if)\b/gi, "")
@@ -119,10 +132,11 @@ function parseFastRegEx(query) {
     minPrice,
     colors: detectedColors,
     sizes: filteredSizes,
+    inStockOnly,
     isComparison,
     comparisonEntities,
     cleanSearchQuery,
-    confidence: (maxPrice !== null || detectedColors.length > 0 || filteredSizes.length > 0 || isComparison) ? "high" : "low"
+    confidence: (maxPrice !== null || detectedColors.length > 0 || filteredSizes.length > 0 || inStockOnly || isComparison) ? "high" : "low"
   };
 }
 
@@ -138,7 +152,7 @@ function parseFastRegEx(query) {
  */
 async function parseEcommerceQuery(query, options = {}) {
   if (!query || typeof query !== "string") {
-    return { maxPrice: null, minPrice: null, colors: [], sizes: [], isComparison: false, comparisonEntities: [] };
+    return { maxPrice: null, minPrice: null, colors: [], sizes: [], inStockOnly: false, isComparison: false, comparisonEntities: [] };
   }
 
   // Tier 1: Fast RegEx (0ms, 0 cost)
@@ -146,7 +160,7 @@ async function parseEcommerceQuery(query, options = {}) {
 
   // If Tier 1 identified clear constraints or comparison, use it directly (saves LLM tokens)
   if (tier1.confidence === "high") {
-    console.log(`⚡ [E-Commerce Query Parser - Tier 1 Fast Path] Found: maxPrice=${tier1.maxPrice}, sizes=[${tier1.sizes.join(",")}], colors=[${tier1.colors.join(",")}], isComparison=${tier1.isComparison}`);
+    console.log(`⚡ [E-Commerce Query Parser - Tier 1 Fast Path] Found: maxPrice=${tier1.maxPrice}, sizes=[${tier1.sizes.join(",")}], colors=[${tier1.colors.join(",")}], inStockOnly=${tier1.inStockOnly}, isComparison=${tier1.isComparison}`);
     return tier1;
   }
 
@@ -167,12 +181,13 @@ JSON Format:
   "minPrice": number or null,
   "colors": array of color strings,
   "sizes": array of size strings (e.g. "S", "M", "L", "XL"),
+  "inStockOnly": boolean,
   "isComparison": boolean,
   "comparisonEntities": array of 2-3 product name strings being compared
 }
 User Query: "${query.replace(/"/g, '\\"')}"`;
 
-    const raw = await callOpenRouterChat({
+    const llmPromise = callOpenRouterChat({
       messages: [
         { role: "system", content: "You are a precise JSON query parameter extractor for e-commerce search." },
         { role: "user", content: prompt }
@@ -184,7 +199,14 @@ User Query: "${query.replace(/"/g, '\\"')}"`;
       sessionId: options.sessionId,
     });
 
-    const cleanJson = raw.replace(/```json|```/g, "").trim();
+    const timeoutPromise = new Promise((resolve) =>
+      setTimeout(() => resolve("{}"), 2500)
+    );
+
+    const raw = await Promise.race([llmPromise, timeoutPromise]);
+
+    const jsonMatch = typeof raw === "string" ? raw.match(/\{[\s\S]*\}/) : null;
+    const cleanJson = jsonMatch ? jsonMatch[0] : (typeof raw === "string" ? raw.replace(/```json|```/g, "").trim() : "{}");
     const parsed = JSON.parse(cleanJson);
 
     return {
@@ -192,6 +214,7 @@ User Query: "${query.replace(/"/g, '\\"')}"`;
       minPrice: typeof parsed.minPrice === "number" ? parsed.minPrice : tier1.minPrice,
       colors: Array.isArray(parsed.colors) ? parsed.colors : tier1.colors,
       sizes: Array.isArray(parsed.sizes) ? parsed.sizes : tier1.sizes,
+      inStockOnly: Boolean(parsed.inStockOnly || tier1.inStockOnly),
       isComparison: Boolean(parsed.isComparison || tier1.isComparison),
       comparisonEntities: Array.isArray(parsed.comparisonEntities) && parsed.comparisonEntities.length >= 2 ? parsed.comparisonEntities : tier1.comparisonEntities
     };

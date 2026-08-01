@@ -2,15 +2,13 @@ const axios = require("axios");
 const { callOpenRouterChat } = require("../llmService");
 const { logLlmUsage } = require("../llmUsageService");
 
-const RERANK_SCORE_THRESHOLD = 0.75;
-const CONFIDENCE_ABSTENTION_THRESHOLD = 0.35;
-const MAX_RERANKED_TOP_K = 3;
+const RERANK_SCORE_THRESHOLD = 0.1;
+const CONFIDENCE_ABSTENTION_THRESHOLD = 0.05;
+const MAX_RERANKED_TOP_K = 5;
 
 /* ============================================================================
- * COHERE RERANKER (COMMENTED OUT FOR REFERENCE AS REQUESTED)
- * To switch back to Cohere Rerank v3.5, uncomment this function and call cohereRerank()
- * inside rerankCandidates() below.
- * ============================================================================
+ * COHERE RERANKER
+ * ============================================================================ */
 async function cohereRerank(query, documents, options = {}) {
   const cohereApiKey = process.env.COHERE_API_KEY;
   const openRouterApiKey = process.env.OPENROUTER_API_KEY;
@@ -30,7 +28,7 @@ async function cohereRerank(query, documents, options = {}) {
             Authorization: `Bearer ${cohereApiKey}`,
             "Content-Type": "application/json",
           },
-          timeout: 10_000,
+          timeout: 3500,
         },
       );
 
@@ -66,7 +64,7 @@ async function cohereRerank(query, documents, options = {}) {
             Authorization: `Bearer ${openRouterApiKey}`,
             "Content-Type": "application/json",
           },
-          timeout: 10_000,
+          timeout: 3500,
         },
       );
 
@@ -89,7 +87,64 @@ async function cohereRerank(query, documents, options = {}) {
 
   return null;
 }
-============================================================================ */
+
+/**
+ * 2nd-Stage Reranker using Jina AI Reranker (Default: jina-reranker-v3).
+ * Performs high-precision joint Query-Document relevance scoring.
+ */
+async function jinaRerank(query, documents, options = {}) {
+  const rawApiKey = process.env.JINA_API_KEY || "";
+  const jinaApiKey = rawApiKey.split("#")[0].trim();
+  const rawModel = process.env.JINA_RERANK_MODEL || "jina-reranker-v3";
+  const modelName = rawModel.split("#")[0].trim();
+
+  if (jinaApiKey) {
+    try {
+      const response = await axios.post(
+        "https://api.jina.ai/v1/rerank",
+        {
+          model: modelName,
+          query,
+          documents,
+          top_n: Math.min(documents.length, 10),
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${jinaApiKey}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 5000,
+        },
+      );
+
+      const results = response.data?.results || [];
+      if (Array.isArray(results) && results.length > 0) {
+        logLlmUsage({
+          botId: options.botId,
+          sessionId: options.sessionId,
+          operation: "rerank",
+          modelName: `jina/${modelName}`,
+        }).catch(() => {});
+
+        return results.map((res) => {
+          let scoreVal = Number(res.relevance_score);
+          // Apply Sigmoid calibration if raw logit scores are returned (e.g. jina-reranker-v3)
+          if (modelName.includes("v3") || scoreVal < 0 || scoreVal > 1) {
+            scoreVal = 1.0 / (1.0 + Math.exp(-scoreVal));
+          }
+          return {
+            index: res.index,
+            relevanceScore: parseFloat(scoreVal.toFixed(4)),
+          };
+        });
+      }
+    } catch (err) {
+      console.warn("⚠️ Direct Jina AI API rerank error:", err.message);
+    }
+  }
+
+  return null;
+}
 
 /**
  * 2nd-Stage Reranker using BAAI BGE Reranker (Open-Source, Free via Hugging Face Serverless API).
@@ -113,10 +168,9 @@ async function bgeRerank(query, documents, options = {}) {
             Authorization: `Bearer ${hfApiKey}`,
             "Content-Type": "application/json",
           },
-          timeout: 30000,
+          timeout: 3500,
         },
       );
-      console.log("Hugging  face  api call success");
 
       const rawData = response.data;
       const scores = Array.isArray(rawData[0]) ? rawData[0] : rawData;
@@ -130,27 +184,32 @@ async function bgeRerank(query, documents, options = {}) {
         }).catch(() => {});
 
         return scores.map((item, index) => {
-          const rawScore = typeof item === "number" ? item : (item.score ?? 0.5);
-          // BGE reranker models output raw logit scores. Convert to [0, 1] via Sigmoid if unbounded.
-          const normalizedScore =
-            rawScore > 1.0 || rawScore < 0.0
-              ? 1.0 / (1.0 + Math.exp(-rawScore))
-              : rawScore;
+          let hfScore = 0.5;
+          if (typeof item === "number") {
+            hfScore = item;
+          } else if (item && typeof item === "object") {
+            hfScore = typeof item.score === "number" ? item.score : 0.5;
+          }
+
+          // Bound hfScore to prevent log(0) / infinity
+          const safeScore = Math.max(Math.min(hfScore, 0.999999), 1e-10);
+          // Reconstruct raw BGE-Reranker logit z = ln(s / (1 - s))
+          const logit = Math.log(safeScore / (1 - safeScore));
+          // Calibrate BGE-v2-m3 logits onto standard 0.0 - 1.0 relevance scale
+          const calibratedScore = 1.0 / (1.0 + Math.exp(-(logit + 4.5) / 1.5));
+
           return {
             index,
-            relevanceScore: parseFloat(normalizedScore.toFixed(4)),
+            relevanceScore: parseFloat(calibratedScore.toFixed(4)),
           };
         });
       }
     } catch (err) {
-      console.warn(
-        "⚠️ HuggingFace BGE Reranker API error, falling back to OpenRouter Cross-Encoder:",
-        err.message,
-      );
+      console.warn("⚠️ HuggingFace BGE Reranker API error:", err.message);
     }
   }
 
-  return null; // Fallback to OpenRouter Cross-Encoder scoring below
+  return null;
 }
 
 /**
@@ -160,9 +219,10 @@ async function bgeRerank(query, documents, options = {}) {
 async function crossEncoderLLMScoring(query, candidateChunks, options = {}) {
   if (!candidateChunks || candidateChunks.length === 0) return [];
 
+  const queryForScoring = (query || "").split("\n\n")[0].trim();
+
   const chunksText = candidateChunks
     .map(
-      // (c, i) => `[CHUNK ${i + 1}]:\n${(c.payload?.text || "").slice(0, 400)}`,
       (c, i) =>
         `[CHUNK ${i + 1} | Title: ${c.payload?.pageTitle || "Page"} | URL: ${c.payload?.url || ""}]:\n${(c.payload?.contextualText || c.payload?.text || "").slice(0, 1000)}`,
     )
@@ -185,7 +245,7 @@ Reply ONLY with a JSON array of objects in this exact format:
         { role: "system", content: systemInstruction },
         {
           role: "user",
-          content: `Query: ${query}\n\nCandidate Chunks:\n${chunksText}`,
+          content: `Query: ${queryForScoring}\n\nCandidate Chunks:\n${chunksText}`,
         },
       ],
       temperature: 0.0,
@@ -194,17 +254,40 @@ Reply ONLY with a JSON array of objects in this exact format:
       botId: options.botId,
       sessionId: options.sessionId,
     });
+    console.log("🎯 [Cross-Encoder Raw Output]:", raw);
 
-    const jsonStr = raw.replace(/```json|```/g, "").trim();
+    const rawStr = typeof raw === "string" ? raw : String(raw || "");
+    const matchJson = rawStr.match(/\[[\s\S]*\]/);
+    const jsonStr = matchJson
+      ? matchJson[0]
+      : rawStr.replace(/```json|```/g, "").trim();
     const scores = JSON.parse(jsonStr);
 
     return candidateChunks.map((chunk, i) => {
-      const match = scores.find((s) => s.index === i);
+      let scoreVal = 0.8;
+      if (Array.isArray(scores)) {
+        const match =
+          scores.find(
+            (s) =>
+              typeof s === "object" &&
+              s !== null &&
+              (s.index === i ||
+                s.index === i + 1 ||
+                s.chunk === i ||
+                s.chunk === i + 1 ||
+                s.item === i ||
+                s.item === i + 1),
+          ) || scores[i];
+
+        if (typeof match === "number") {
+          scoreVal = match;
+        } else if (match && typeof match.score === "number") {
+          scoreVal = match.score;
+        }
+      }
       return {
         ...chunk,
-        relevanceScore: match
-          ? parseFloat(match.score.toFixed(4))
-          : chunk.score || 0.5,
+        relevanceScore: parseFloat(Number(scoreVal).toFixed(4)),
       };
     });
   } catch (error) {
@@ -214,7 +297,7 @@ Reply ONLY with a JSON array of objects in this exact format:
     );
     return candidateChunks.map((c) => ({
       ...c,
-      relevanceScore: c.score || 0.8,
+      relevanceScore: c.rrfScore ?? 0.8,
     }));
   }
 }
@@ -222,8 +305,8 @@ Reply ONLY with a JSON array of objects in this exact format:
 /**
  * Stage L, M, N: 2nd-Stage Reranker & Selection.
  *
- * Scores joint Query-Document relevance using open-source BGE Reranker (BAAI/bge-reranker-v2-m3 via HuggingFace free API
- * or OpenRouter Cross-Encoder fallback), then filters chunks meeting the relevance score threshold (> 0.75) up to Top 5.
+ * Scores joint Query-Document relevance using configured provider (Jina AI / BGE / Cohere via .env),
+ * then filters chunks meeting the relevance score threshold (> 0.10) up to Top 5.
  *
  * @param {string}  query            - User query or HyDE expanded query
  * @param {Array}   candidateChunks  - Candidates from RRF Hybrid Search
@@ -234,12 +317,12 @@ async function rerankCandidates(query, candidateChunks, options = {}) {
   if (!candidateChunks || candidateChunks.length === 0) return [];
 
   // Apply URL-level Diversity Filtering: max 2 child chunks per distinct page URL
-  // Guarantees multi-product/multi-page coverage so a single page doesn't crowd out other relevant pages
   const parentCounts = new Map();
   const diverseCandidates = [];
 
   for (const candidate of candidateChunks) {
-    const parentKey = candidate.payload?.url || candidate.payload?.parentId || candidate.id;
+    const parentKey =
+      candidate.payload?.url || candidate.payload?.parentId || candidate.id;
     const count = parentCounts.get(parentKey) || 0;
     if (count < 2) {
       parentCounts.set(parentKey, count + 1);
@@ -252,16 +335,63 @@ async function rerankCandidates(query, candidateChunks, options = {}) {
     (c) => c.payload?.contextualText || c.payload?.text || "",
   );
 
-  // 1. Try Hugging Face Free BGE Reranker API
-  const bgeScores = await bgeRerank(query, docTexts, options);
+  const rawProvider =
+    process.env.RERANKER_PROVIDER || process.env.RERANK_PROVIDER || "jina";
+  const provider = rawProvider.split("#")[0].trim().toLowerCase();
+  console.log(
+    `\n🔍 [2nd-Stage Reranker Initializing] Provider Config: "${provider.toUpperCase()}"`,
+  );
+
+  let rerankScores = null;
+  let providerTag = "";
+
+  if (provider === "none" || provider === "off" || provider === "disabled") {
+    console.log(
+      "ℹ️ [2nd-Stage Reranker Bypassed] RERANKER_PROVIDER is set to NONE. Using RRF Hybrid Search vector rankings directly.",
+    );
+    rerankScores = topCandidates.map((c, idx) => ({
+      index: idx,
+      relevanceScore: parseFloat(Math.max(0.85 - idx * 0.02, 0.7).toFixed(4)),
+    }));
+    providerTag = "RRF Vector Rankings (Reranker Disabled)";
+  } else if (provider === "bge") {
+    console.log(
+      "🚀 [Executing Reranker Engine] BAAI BGE Reranker (BAAI/bge-reranker-v2-m3)...",
+    );
+    rerankScores = await bgeRerank(query, docTexts, options);
+    providerTag = "BAAI BGE Reranker (BAAI/bge-reranker-v2-m3)";
+  } else if (provider === "cohere") {
+    console.log(
+      "🚀 [Executing Reranker Engine] Cohere Rerank (rerank-v3.5)...",
+    );
+    rerankScores = await cohereRerank(query, docTexts, options);
+    providerTag = "Cohere Rerank v3.5";
+  } else {
+    // Default: Jina AI Reranker
+    const jinaModel = process.env.JINA_RERANK_MODEL || "jina-reranker-v3";
+    console.log(
+      `🚀 [Executing Reranker Engine] Jina AI Reranker (${jinaModel})...`,
+    );
+    rerankScores = await jinaRerank(query, docTexts, options);
+    providerTag = `Jina AI Reranker (${jinaModel})`;
+
+    // If Jina API wasn't configured or failed, fall back to BGE if HF_API_KEY exists
+    if (!rerankScores && (process.env.HF_API_KEY || process.env.HF_TOKEN)) {
+      console.log(
+        "⚠️ [Jina AI Reranker Unreachable/Fallback] Falling back to BAAI BGE Reranker via HuggingFace API...",
+      );
+      rerankScores = await bgeRerank(query, docTexts, options);
+      providerTag = "BAAI BGE Reranker (HF Fallback)";
+    }
+  }
 
   let scoredCandidates = [];
 
-  if (bgeScores && bgeScores.length > 0) {
+  if (rerankScores && rerankScores.length > 0) {
     console.log(
-      "🎯 [2nd-Stage BGE Reranker] BAAI/bge-reranker-v2-m3 (HuggingFace Free API) successfully evaluated candidate relevance",
+      `✅ [2nd-Stage Reranker SUCCESS] Active Engine: "${providerTag}" successfully evaluated ${rerankScores.length} candidate chunks`,
     );
-    scoredCandidates = bgeScores.map((res) => {
+    scoredCandidates = rerankScores.map((res) => {
       const point = topCandidates[res.index];
       return {
         ...point,
@@ -270,7 +400,7 @@ async function rerankCandidates(query, candidateChunks, options = {}) {
     });
   } else {
     console.log(
-      "🎯 [2nd-Stage Reranker] Running OpenRouter Cross-Encoder Joint Relevance Scorer",
+      "⚠️ [2nd-Stage Reranker Fallback] Primary reranker unavailable. Running OpenRouter Cross-Encoder LLM Scorer...",
     );
     scoredCandidates = await crossEncoderLLMScoring(
       query,
@@ -279,12 +409,27 @@ async function rerankCandidates(query, candidateChunks, options = {}) {
     );
   }
 
-  // Filter candidates matching threshold > 0.75
+  // Fallback: If top score is 0 or all scores are 0, fall back to RRF vector rankings
+  const maxScore = Math.max(
+    ...scoredCandidates.map((c) => c.relevanceScore || 0),
+    0,
+  );
+  if (maxScore === 0) {
+    console.log(
+      "⚠️ [Reranker Fallback] Cross-Encoder scored all chunks 0.00. Preserving top RRF vector candidates for LLM context synthesis.",
+    );
+    scoredCandidates = topCandidates.map((c, idx) => ({
+      ...c,
+      relevanceScore: parseFloat(Math.max(0.85 - idx * 0.02, 0.75).toFixed(4)),
+    }));
+  }
+
+  // Filter candidates matching threshold > 0.10
   let filtered = scoredCandidates.filter(
     (c) => c.relevanceScore >= RERANK_SCORE_THRESHOLD,
   );
 
-  // Fallback: If no candidate passed 0.75 threshold, take top 3 highest scoring candidates
+  // Fallback: If no candidate passed threshold, take top 3 highest scoring candidates
   if (filtered.length === 0) {
     console.log(
       `⚠️ [Reranker] No candidate exceeded score threshold ${RERANK_SCORE_THRESHOLD} — taking top candidates`,
@@ -304,4 +449,11 @@ async function rerankCandidates(query, candidateChunks, options = {}) {
   return selectedTop5;
 }
 
-module.exports = { rerankCandidates, bgeRerank, RERANK_SCORE_THRESHOLD, CONFIDENCE_ABSTENTION_THRESHOLD };
+module.exports = {
+  rerankCandidates,
+  jinaRerank,
+  bgeRerank,
+  cohereRerank,
+  RERANK_SCORE_THRESHOLD,
+  CONFIDENCE_ABSTENTION_THRESHOLD,
+};
